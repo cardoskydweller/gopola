@@ -1,0 +1,16 @@
+{
+  "about": "one string instead of a list: 200 with one row",
+  "source": "ollama 0.40.3 at localhost:11434, 2026-10-13; the row cut to its first 4 of 768 numbers",
+  "request": {"model": "embeddinggemma-2:270m", "input": "hello world", "truncate": true},
+  "status": 200,
+  "keys_include": ["model", "embeddings", "total_duration", "load_duration", "prompt_eval_count"],
+  "rows": 1,
+  "row_len": 768,
+  "response": {
+    "model": "embeddinggemma-2:270m",
+    "embeddings": [[-0.021137318, 0.04118825, 0.046235565, -0.031825747]],
+    "total_duration": 66752750,
+    "load_duration": 36710125,
+    "prompt_eval_count": 4
+  }
+}
