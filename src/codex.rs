@@ -83,6 +83,7 @@ pub fn classify(line: &str) -> Parsed {
         }
         "item/FileChange" => {
             let Some(ts) = ts() else { return Parsed::Unreadable };
+            if item["status"] != "completed" { return Parsed::Ignored }
             let Some(changes) = item["changes"].as_object() else { return Parsed::Unreadable };
             let files = changes.iter().flat_map(|(path, c)| std::iter::once(path.clone()).chain(str_at(c, "move_path"))).collect();
             Parsed::Event(Event::Reply { ts, text: None, files, tools: vec!["apply_patch".into()], reads: vec![], commands: vec![] })
@@ -202,6 +203,15 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_without_text_blocks_has_no_reply_text() {
+        let empty = item(r#"{"type":"AgentMessage","id":"a","content":[],"phase":"final_answer"}"#);
+        match classify(&empty) {
+            Parsed::Event(Event::Reply { text, .. }) => assert_eq!(text, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn command_execution_gives_command_and_reads() {
         assert_eq!(
             classify(line(EXEC, r#""type":"read""#)),
@@ -255,6 +265,12 @@ mod tests {
             Parsed::Event(Event::Reply { files, .. }) => assert_eq!(files, vec!["/work/demo-app/old.md", "/work/demo-app/new.md"]),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn declined_file_change_is_not_an_edit() {
+        let declined = item(r#"{"type":"FileChange","id":"p","changes":{"/work/demo-app/README.md":{"type":"update"}},"status":"declined"}"#);
+        assert_eq!(classify(&declined), Parsed::Ignored);
     }
 
     #[test]

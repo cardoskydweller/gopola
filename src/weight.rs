@@ -391,14 +391,15 @@ fn shell_first_word(s: &str) -> String {
 
 fn zshguard_rules(s: &str) -> Vec<String> {
     static RULE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?m)^[ \t]*[0-9]+\. \[([^\s\[\]]+)\]").unwrap()
+        regex::Regex::new(r"(?m)^[ \t]*[0-9]+\. \[([^\s\[\]]+)\][ \t]+").unwrap()
     });
     RULE.captures_iter(s).map(|c| {
         match &c[1] {
             rule @ ("modifier" | "equals" | "nomatch" | "for-scalar" | "tied-var" | "bfs-time"
                 | "pipestatus" | "list-arg" | "split-arg" | "adb-stdin" | "pipe-filter"
                 | "bg-filter" | "pgrep-wait" | "clean-guard" | "inplace" | "inplace-redirect"
-                | "alt-arg" | "tools-filter" | "switch-track" | "gh-auth-switch" | "gh-wrong-account") => rule,
+                | "alt-arg" | "tools-filter" | "switch-track" | "gh-auth-switch" | "gh-wrong-account"
+                | "git-grep-escape") => rule,
             _ => "?",
         }.to_string()
     }).collect()

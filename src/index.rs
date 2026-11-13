@@ -200,13 +200,14 @@ pub fn run(c: &mut Connection, full: bool) -> Result<Report, Box<dyn std::error:
     if full {
         // A session with no transcript and no copy left cannot be read again: a rebuild keeps its rows.
         let keep: Vec<String> = c.prepare("select id, path from sessions")?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.flatten()
-            .filter(|(_, p)| !crate::archive::exists(Path::new(p))).map(|(id, _)| id).collect();
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter().filter(|(_, p)| !crate::archive::exists(Path::new(p))).map(|(id, _)| id).collect();
         crate::db::reset_transcript_tables(c, &keep)?;
     }
     let mut report = Report { files_seen: 0, files_indexed: 0, turns_written: 0, lines_skipped: 0 };
     let moves: Vec<(String, String)> = c.prepare("select old, new from moves")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten().collect();
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let encoded: Vec<(String, String)> = moves.iter().map(|(old, new)| (encode(old), encode(new))).collect();
     // Imports first: an imported session keeps its row when Claude Code's own copy of it is read later.
     // `archive::list` adds the folders and transcripts Claude Code deleted that the archive still has.
@@ -293,7 +294,7 @@ fn codex_titles(c: &Connection) -> rusqlite::Result<()> {
     // A session stored as nothing (an excluded project, a subagent) has no `started_at`, and gets no title either.
     let rows: Vec<(String, String, String, Option<String>)> = c
         .prepare("select id, project, started_at, title from sessions where harness = 'codex' and started_at is not null")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.flatten().collect();
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
     for (id, project, started, old) in rows {
         if let Some(new) = titles.get(&id).filter(|t| old.as_ref() != Some(*t)) {
             c.execute("update sessions set title = ?2 where id = ?1", params![id, new])?;
@@ -623,8 +624,7 @@ fn refresh_commits(
     let shas: Vec<String> = tx
         .prepare("select sha from commits where session_id = ?1")?
         .query_map([id], |r| r.get(0))?
-        .flatten()
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
     for sha in shas {
         crate::db::fts_delete(tx, "commit", &sha)?;
     }
