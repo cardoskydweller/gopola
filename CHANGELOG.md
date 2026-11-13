@@ -3,6 +3,15 @@
 What changed in each version, and why. Every feature here was built after a real question went unanswered, so each
 entry names the question.
 
+## 0.19.1 — 2026-11-13
+
+**Fixes from 0.19.0's review.** `weight --agents`, `commands` and `hooks` read a Workflow's agents
+(`subagents/workflows/wf_<run>/agent-<id>.jsonl`) beside the session's other subagents; before, a session that ran a
+Workflow showed none of their calls. `weight --agents` on a Copilot session says on stderr that it reads Claude Code
+subagents only, where it was dropped without a word. `skills` logs as hits only the names with a call or a `/<name>`
+turn, so a query whose names were never called is logged as finding nothing. `codex-hook --install` names the file it
+could not write (a `hooks.json` link into a missing folder printed only "No such file or directory").
+
 ## 0.19.0 — 2026-11-13
 
 **New: `weight --agents`.** The question: how big is each subagent's first call, by agent type? `weight` on a

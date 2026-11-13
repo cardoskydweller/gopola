@@ -548,7 +548,7 @@ pub fn codex_install(bin: &str) -> Res {
         target = target.with_file_name(std::fs::read_link(&target)?);
     }
     // Written beside the target, then renamed: a write cut short never leaves the owner's hooks half a file.
-    write_codex_hooks(&target, &(serde_json::to_string_pretty(&new)? + "\n"))?;
+    write_codex_hooks(&target, &(serde_json::to_string_pretty(&new)? + "\n")).map_err(|e| format!("{}: {e}", target.display()))?;
     println!("wrote {} (Codex SessionStart hook)", path.display());
     Ok(())
 }

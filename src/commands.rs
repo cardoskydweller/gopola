@@ -94,10 +94,13 @@ fn when(ts: &str) -> String {
     format!("{}Z", ts.chars().take(19).collect::<String>().replacen('T', " ", 1))
 }
 
-/// A session's own transcript, and its subagents' (`<id>/subagents/agent-<agent>.jsonl`): (session, file, agent).
+/// A session's own transcript, and its subagents' (`<id>/subagents/agent-<agent>.jsonl`, and a Workflow's agents'
+/// `<id>/subagents/workflows/wf_<run>/agent-<agent>.jsonl`): (session, file, agent).
 pub fn session_files(id: &str, path: &str) -> Vec<(String, PathBuf, Option<String>)> {
     let main = PathBuf::from(path);
-    let agents: Vec<_> = crate::archive::list(&main.with_extension("").join("subagents")).into_iter()
+    let subagents = main.with_extension("").join("subagents");
+    let workflows = crate::archive::list(&subagents.join("workflows")).into_iter().flat_map(|run| crate::archive::list(&run));
+    let agents: Vec<_> = crate::archive::list(&subagents).into_iter().chain(workflows)
         .filter_map(|p| {
             let agent = p.file_name()?.to_str()?.strip_prefix("agent-")?.strip_suffix(".jsonl")?.to_string();
             Some((id.to_string(), p, Some(agent)))
