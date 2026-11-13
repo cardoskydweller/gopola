@@ -3,6 +3,13 @@
 What changed in each version, and why. Every feature here was built after a real question went unanswered, so each
 entry names the question.
 
+## 0.18.2 — 2026-11-13
+
+**New: release binaries are built in the public repo.** A binary built on a Mac named a private commit, so nobody could
+check it against the public source. `release.yml` now builds macOS arm64 and Linux musl binaries from a `v*` tag,
+stamps `--version` with the public commit and its date, attests build provenance, and publishes the binaries with
+`SHA256SUMS`. The README shows how to verify them.
+
 ## 0.18.1 — 2026-11-13
 
 **Fixes from review.** Codex ignores declined file changes, reports compressed rollouts that changed after indexing,
