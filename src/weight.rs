@@ -438,6 +438,7 @@ fn copilot_segment_git(segment: &CopilotSegment) -> (String, Option<Vec<String>>
 }
 
 fn copilot_weight(o: &Opts, id: &str, path: &str) -> Res {
+    if o.agents { eprintln!("gopola: --agents reads Claude Code subagents only; this Copilot session's figures follow without it") }
     let reader = crate::archive::open(std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
     let mut segments: Vec<CopilotSegment> = Vec::new();
     let mut calls: Vec<CopilotCall> = Vec::new();

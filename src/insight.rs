@@ -257,7 +257,7 @@ pub fn skills(o: &Opts, names: &[String]) -> Res {
     }
     let mut rows: Vec<(String, Row)> = rows.into_iter().map(|(n, mut r)| { r.slash = slash.get(&n).copied().unwrap_or(0); (n, r) }).collect();
     rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then(a.0.cmp(&b.0)));
-    crate::db::log_usage(&c, "skills", &project, rows.len() as i64);
+    crate::db::log_usage(&c, "skills", &project, rows.iter().filter(|(_, r)| r.calls + r.slash > 0).count() as i64);
     let day = |ts: &str| ts.get(..10).unwrap_or("").to_string();
     if o.json {
         let v: Vec<Value> = rows.iter().map(|(n, r)| json!({"skill": n, "calls": r.calls, "sessions": r.sessions.len(), "slash": r.slash,

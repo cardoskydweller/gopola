@@ -1741,6 +1741,11 @@ fn skills_counts_skill_calls_by_name() {
     let lines: Vec<&str> = out.lines().filter(|l| l.contains("writing-skills") || l.contains("session-retro")).collect();
     assert_eq!(lines.len(), 2, "exactly the names asked: {out}");
     assert!(lines.iter().any(|l| l.starts_with("writing-skills") && l.split_whitespace().nth(1) == Some("0")), "a name asked for shows zeros: {out}");
+    // 0.19.0's Opus review, S2: a row of zeros was logged as a hit.
+    let hits = || rusqlite_open(&w.db).query_row("select hits from usage where cmd = 'skills' order by rowid desc limit 1", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(hits(), 1, "only session-retro was called");
+    gopola(&w, &["skills", "writing-skills"]);
+    assert_eq!(hits(), 0, "a name with no call is no hit");
     fs::remove_dir_all(&w.base).unwrap();
 }
 
@@ -1783,6 +1788,12 @@ fn weight_agents_measures_each_subagent_transcript() {
     fs::copy(sub.join("agent-b2.jsonl"), deeper.join("agent-c3.jsonl")).unwrap();
     let (ok, out, err) = gopola(&w, &["weight", &deeper.join("agent-c3.jsonl").to_string_lossy()]);
     assert!(ok && out.contains("model calls  2") && out.contains("first 48k"), "a subagent file measures its own calls: {out}{err}");
+    // 0.19.0's Opus review, S1 (owner, 2026-11-13: list them): --agents lists a Workflow's agents too.
+    fs::write(deeper.join("agent-c3.meta.json"), serde_json::json!({"agentType": "workflow-subagent", "description": "verify:r1"}).to_string()).unwrap();
+    let (_, out, _) = gopola(&w, &["weight", "eeee7777", "--agents", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let got: Vec<(&str, &str)> = v["agents"].as_array().unwrap().iter().map(|x| (x["agent"].as_str().unwrap(), x["type"].as_str().unwrap())).collect();
+    assert_eq!(got, [("b2", "worker"), ("c3", "workflow-subagent"), ("a1", "general-purpose")], "{out}");
     fs::remove_dir_all(&w.base).unwrap();
 }
 
@@ -1881,6 +1892,13 @@ fn commands_lists_bash_calls_with_status_output_and_subagents() {
     assert_eq!(exact("Docker"), ["open -a Docker; say \"hi\""], "exact and case-sensitive");
     assert_eq!(exact("say \"hi\""), ["open -a Docker; say \"hi\""], "a quote in the needle");
     assert_eq!(exact("cargo"), ["cargo test"], "a subagent's command is searched too");
+    // A Workflow's agent sits under subagents/workflows/wf_<run>/ (0.19.0's Opus review, S1; owner, 2026-11-13).
+    let run = transcript_dir(&w).join("eeee5555-0000-4000-8000-000000000005/subagents/workflows/wf_1");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join("agent-wf1.jsonl"), bash_use("2026-09-01T10:00:12Z", "w1", "Bash", "just test") + "\n").unwrap();
+    let (_, out, _) = gopola(&w, &["commands", "eeee5555", "--grep", "just test", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["commands"][0]["command"].as_str(), v["commands"][0]["agent"].as_str()), (Some("just test"), Some("wf1")), "{out}");
     fs::remove_dir_all(&w.base).unwrap();
 }
 
@@ -1972,6 +1990,13 @@ fn hooks_lists_each_run_with_status_blocks_and_subagents() {
     assert!(out.contains("  > # gopola: one\n  … 1 more lines") && out.contains("  > You have superpowers."), "{out}");
     let (_, out, _) = gopola(&w, &["hooks", "abab7777", "--grep", "Stop", "--json"]);
     assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["hooks"].as_array().unwrap().len(), 4, "--grep matches the hook name too");
+    // A Workflow's agent (0.19.0's Opus review, S1; owner, 2026-11-13).
+    let run = sub.join("workflows/wf_1");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join("agent-wf1.jsonl"), hook("2026-09-01T10:00:10Z", serde_json::json!({"type": "hook_success", "hookName": "PreToolUse:Bash",
+        "command": "zshguard hook", "exitCode": 0, "durationMs": 5, "stdout": "", "stderr": ""})) + "\n").unwrap();
+    let (_, out, _) = gopola(&w, &["hooks", "abab7777"]);
+    assert!(out.contains("10 hook run(s), 2 by subagents, 4 not ok"), "{out}");
     fs::remove_dir_all(&w.base).unwrap();
 }
 
@@ -3140,6 +3165,9 @@ fn copilot_weight_by_path_uses_compact_text_and_optional_call_table() {
     let f = copilot_dir(&w, CP, "weight-segments.jsonl").join("events.jsonl");
     let (ok, out, err) = gopola(&w, &["weight", &f.to_string_lossy()]);
     assert!(ok, "{err}");
+    // 0.19.0's Opus review, S3: --agents on a Copilot session was dropped without a word.
+    let (ok2, out2, err2) = gopola(&w, &["weight", &f.to_string_lossy(), "--agents"]);
+    assert!(ok2 && out2 == out && err2.contains("--agents reads Claude Code subagents only"), "{err2}");
     assert!(out.starts_with("# weight c1000000"));
     assert!(out.contains("credits/call=1.1667"), "{out}");
     assert!(out.contains("credits/call=1.5000"), "{out}");
@@ -3821,6 +3849,19 @@ fn codex_hook_install_writes_through_a_link_to_a_missing_file() {
     assert!(ok, "{err}");
     assert!(fs::symlink_metadata(&hooks).unwrap().file_type().is_symlink());
     assert!(fs::read_to_string(w.base.join("codex/dotfiles/hooks.json")).unwrap().contains("gopola codex-hook"));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// 0.18.3's Opus review: a link into a missing folder failed with only 'No such file or directory (os error 2)'.
+#[test]
+fn codex_hook_install_names_the_path_it_cannot_write() {
+    let w = setup();
+    let hooks = w.base.join("codex/hooks.json");
+    fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("nodir/hooks.json", &hooks).unwrap();
+
+    let (ok, _, err) = gopola(&w, &["codex-hook", "--install", "/demo/bin"]);
+    assert!(!ok && err.contains("codex/nodir/hooks.json: No such file or directory"), "{err}");
     fs::remove_dir_all(&w.base).unwrap();
 }
 

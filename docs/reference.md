@@ -492,7 +492,7 @@ the time of the result, the command and the output.
 - `--head N` cuts each output to N lines and says how many it cut. Nothing is cut without it.
 - `--no-output` prints no output, also with `--json`. Use it when you keep the commands and an output can hold a
   secret.
-- Subagents' calls are included, from their own transcripts.
+- Subagents' calls are included, from their own transcripts; a Workflow's agents too.
 - A large output that Claude Code saved to a file is printed from that file; if the file is gone, from the 2 KB
   preview in the transcript.
 - Secrets are redacted with the same rules as the index.
@@ -578,8 +578,9 @@ background, agent, outcome, handback: {ts, state} | null, prompt}]}`.
 
     gopola hooks <session> [--grep <text>] [--head N]
 
-Each hook run of a session and its subagents, in time order. Each row has the time, the hook (for example
-`SessionStart:startup`, `PreToolUse:Bash` or `Stop`), the status, the duration and the command. The table shows the
+Each hook run of a session and its subagents (a Workflow's agents too), in time order. Each row has the time, the
+hook (for example `SessionStart:startup`, `PreToolUse:Bash` or `Stop`), the status, the duration and the command. The
+table shows the
 first line of the command, cut at 160 characters. `--json` gives the whole command.
 
 The status is one of these:
@@ -711,11 +712,12 @@ not add up the parts of two chains.
 
 `--json` adds `quiet_s`, `duration_ms` and `idle` per compaction, and `chain: {id, parts: […]}` or `null`.
 
-**Subagents.** `--agents` adds one row per subagent transcript (`<session>/subagents/agent-<id>.jsonl`, or gopola's copy
-of it): the agent id, its calls, its first call in tokens, its median and maximum context, its output tokens, and the
-`agentType` and `description` from `agent-<id>.meta.json`. The rows are in start order. The first call is exact,
+**Subagents.** `--agents` adds one row per subagent transcript (`<session>/subagents/agent-<id>.jsonl`, a Workflow's
+agents in `<session>/subagents/workflows/wf_<run>/agent-<id>.jsonl`, or gopola's copy of either): the agent id, its
+calls, its first call in tokens, its median and maximum context, its output tokens, and the `agentType` and `description` from `agent-<id>.meta.json`. The rows are in start order. The first call is exact,
 because agent types differ there by less than 1k. With `--json`, the same rows are in `agents`. Give `weight` the path
-of one subagent transcript to measure only that agent.
+of one subagent transcript to measure only that agent. For a Copilot session, `--agents` says on stderr that it reads
+Claude Code subagents only, and the report follows without it.
 
 **Copilot CLI.** For a Copilot session, `weight` reads only its `events.jsonl`; it never prints prompt, system, reasoning,
 tool-argument, error or file content. The report has a segment for the start and each resume, preserving the cap from

@@ -257,8 +257,8 @@ claude-mem runs on every tool call, and keeps the same `<private>` convention an
   indexes, sync, or a status line. Add transcript rules to `src/index.rs`; add query behavior to `src/cmds.rs`
   or `src/insight.rs`.
 - **Measure session context.** `src/weight.rs` reports model-call size and context sources, also for each subagent
-  (`--agents`). Not built: cloud log summaries, screenshot size reduction, dollar cost, a per-turn timeline, or Workflow
-  agents (`subagents/workflows/`) in `--agents`. Add weight measures to `src/weight.rs`.
+  (`--agents`, Workflow agents included). Not built: cloud log summaries, screenshot size reduction, dollar cost, or a
+  per-turn timeline. Add weight measures to `src/weight.rs`.
 - **Count skill calls.** `src/insight.rs` provides `skills`, from the indexed commands. Not built: skill calls in
   subagent transcripts, or Codex skills. Add count rules to `src/insight.rs`.
 - **Search by meaning.** `src/embed.rs` and `src/cmds.rs` rank sessions by words and local vectors. Not built:
