@@ -16,7 +16,8 @@ basename of the git toplevel. `--project all` makes the search wider.
     gopola file <path>                               # which past sessions edited it, and why
     gopola digest --since 2026-09-15 [--project all] # per project per day: sessions, turns, commits
     gopola recent [-n 6]                             # the session-start block, on demand
-    gopola weight <session-prefix>                   # context per model call, compactions, and what filled it
+    gopola weight <session-prefix> [--agents]        # context per model call, compactions, and what filled it; --agents: each subagent
+    gopola skills [<name>...]                        # how many times each skill was really called, all projects
     gopola hooks <session-prefix> [--head N]         # each hook run: hook, status (ok, exit N, blocked, timed out), duration, command, stderr
     gopola context <session-prefix> [--grep <text>]  # a Copilot session's system prompt, instruction updates and hook context; --grep counts a text per part
     gopola handback <agent-id-prefix>                # the last report a subagent returned to its session, as received (exit 1: none yet)

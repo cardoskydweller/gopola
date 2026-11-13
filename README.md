@@ -52,6 +52,8 @@ database; an unchanged re-run takes 10–50 ms.
 | Which surviving lines did they write? | `gopola blame <file\|dir> --summary` |
 | What did I do this week? | `gopola digest --since <date> --project all` |
 | Which tools and programs do my sessions actually use? | `gopola tools [--programs]` |
+| How many times was a skill really called? | `gopola skills [<name>...]` |
+| How big was each subagent's context? | `gopola weight <session> --agents` |
 | Is everything wired up? | `gopola doctor` |
 
 Every command takes `--json`. Session ids can be given by prefix.
@@ -254,9 +256,11 @@ claude-mem runs on every tool call, and keeps the same `<private>` convention an
   `recent`, `search`, `show`, `summarize`, `import-claude-mem`, and tool counts. Not built: subagent transcript
   indexes, sync, or a status line. Add transcript rules to `src/index.rs`; add query behavior to `src/cmds.rs`
   or `src/insight.rs`.
-- **Measure session context.** `src/weight.rs` reports model-call size and context sources. Not built: cloud log
-  summaries, screenshot size reduction, dollar cost, or a per-turn timeline. Add weight measures to
-  `src/weight.rs`.
+- **Measure session context.** `src/weight.rs` reports model-call size and context sources, also for each subagent
+  (`--agents`). Not built: cloud log summaries, screenshot size reduction, dollar cost, a per-turn timeline, or Workflow
+  agents (`subagents/workflows/`) in `--agents`. Add weight measures to `src/weight.rs`.
+- **Count skill calls.** `src/insight.rs` provides `skills`, from the indexed commands. Not built: skill calls in
+  subagent transcripts, or Codex skills. Add count rules to `src/insight.rs`.
 - **Search by meaning.** `src/embed.rs` and `src/cmds.rs` rank sessions by words and local vectors. Not built:
   `ask`, friction detection, or in-process embeddings. Add vector logic to `src/embed.rs` and query behavior to
   `src/cmds.rs`.
@@ -275,8 +279,8 @@ claude-mem runs on every tool call, and keeps the same `<private>` convention an
   `src/index.rs`.
 - **Measure `/clear` chains.** `src/weight.rs` reports each transcript part. Not built: chains across folders or
   a chain total. Add chain rules to `src/weight.rs`.
-- **Read full Bash calls.** `src/commands.rs` reads command text, time, status, and output, plus subagent calls.
-  Not built: output-text search or non-Bash tools. Add command parsing to `src/commands.rs`.
+- **Read full Bash calls.** `src/commands.rs` reads command text, time, status, and output, plus subagent calls;
+  `--no-output` leaves the output out. Not built: output-text search or non-Bash tools. Add command parsing to `src/commands.rs`.
 - **Report idle compactions.** `src/weight.rs` reports each compaction and its quiet gap. Not built: a per-turn
   timeline. Add compaction measures to `src/weight.rs`.
 - **List agent dispatches.** `src/dispatches.rs` reports Agent and SendMessage calls, results, and hand-backs.

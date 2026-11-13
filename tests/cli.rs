@@ -1703,6 +1703,89 @@ fn weight_lists_every_transcript_of_a_clear_chain() {
     fs::remove_dir_all(&w.base).unwrap();
 }
 
+/// 2026-11-13, software-factory add684fe: skill calls were counted with `search -n 1000 | rg -c`, which stops at 10 rows
+/// without -n and also counts rows that only name the skill's path.
+#[test]
+fn skills_counts_skill_calls_by_name() {
+    use serde_json::json;
+    let w = setup();
+    let cwd = w.repo.to_string_lossy().to_string();
+    let dir = transcript_dir(&w);
+    let skill = |ts: &str, calls: &[(&str, Option<&str>)]| reply_running(ts, "ok",
+        &calls.iter().map(|(s, a)| ("Skill", json!({"skill": s, "args": a}))).collect::<Vec<_>>());
+    let one = [
+        prompt("2026-11-01T10:00:00Z", "wrap up", &cwd),
+        skill("2026-11-01T10:00:01Z", &[("session-retro", None), ("session-retro", None)]),
+        prompt("2026-11-02T10:00:00Z", "write a skill; read ~/.claude/skills/session-retro/SKILL.md", &cwd),
+        skill("2026-11-02T10:00:01Z", &[("superpowers:writing-skills", None), ("session-retro", Some("live"))]),
+    ];
+    fs::write(dir.join("aaaa0001-0000-4000-8000-000000000001.jsonl"), one.join("\n") + "\n").unwrap();
+    let two = [prompt("2026-11-03T10:00:00Z", "<command-message>session-retro</command-message>\n<command-name>/session-retro</command-name>", &cwd),
+        reply("2026-11-03T10:00:01Z", "Retro done.", None)];
+    fs::write(dir.join("bbbb0002-0000-4000-8000-000000000002.jsonl"), two.join("\n") + "\n").unwrap();
+    assert!(gopola(&w, &["index"]).0);
+
+    let (ok, out, err) = gopola(&w, &["skills", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["project"], "all", "across projects unless --project names one");
+    let row = |name: &str| v["skills"].as_array().unwrap().iter().find(|s| s["skill"] == name).cloned().unwrap_or_default();
+    let r = row("session-retro");
+    assert_eq!((r["calls"].as_u64(), r["sessions"].as_u64(), r["slash"].as_u64()), (Some(2), Some(1), Some(1)),
+        "two turns call it (a repeated call in a turn is one); the path in a prompt is not a call; one /session-retro: {out}");
+    assert_eq!((r["first"].as_str(), r["last"].as_str(), r["projects"].clone()), (Some("2026-11-01"), Some("2026-11-02"), json!(["demo-app"])));
+    assert_eq!(row("superpowers:writing-skills")["calls"], 1);
+    assert!(row("writing-skills").is_null(), "a plugin's name is its own: {out}");
+
+    let (_, out, _) = gopola(&w, &["skills", "writing-skills", "session-retro"]);
+    let lines: Vec<&str> = out.lines().filter(|l| l.contains("writing-skills") || l.contains("session-retro")).collect();
+    assert_eq!(lines.len(), 2, "exactly the names asked: {out}");
+    assert!(lines.iter().any(|l| l.starts_with("writing-skills") && l.split_whitespace().nth(1) == Some("0")), "a name asked for shows zeros: {out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// 2026-11-12, copilot-orchestration 9c783c76: each agent's first call was read with a hand `jq` over
+/// `subagents/agent-*.jsonl`, joined to `agent-*.meta.json`, because `weight` on a subagent file printed nothing.
+#[test]
+fn weight_agents_measures_each_subagent_transcript() {
+    let w = setup();
+    let id = "eeee7777-0000-4000-8000-000000000007";
+    write_session(&w, id, "2026-11-12T10:00:00Z", &[("dispatch two", "Dispatched.")]);
+    let sub = transcript_dir(&w).join(id).join("subagents");
+    fs::create_dir_all(&sub).unwrap();
+    let call = |ts: &str, mid: &str, ctx: u64| serde_json::json!({"type": "assistant", "isSidechain": true, "timestamp": ts,
+        "message": {"id": mid, "content": [], "usage": {"input_tokens": 3, "cache_creation_input_tokens": ctx - 3, "cache_read_input_tokens": 0, "output_tokens": 7}}}).to_string();
+    // The name order (a1, b2) is not the start order (b2, a1).
+    for (agent, ty, desc, start, ctxs) in [("a1", "general-purpose", "Build the thing", "2026-11-12T10:05:00Z", [59862, 70000]),
+        ("b2", "worker", "Review the thing", "2026-11-12T10:01:00Z", [48283, 52000])] {
+        let lines = [call(start, &format!("{agent}m1"), ctxs[0]), call(start, &format!("{agent}m1"), ctxs[0]), call(start, &format!("{agent}m2"), ctxs[1])];
+        fs::write(sub.join(format!("agent-{agent}.jsonl")), lines.join("\n") + "\n").unwrap();
+        fs::write(sub.join(format!("agent-{agent}.meta.json")), serde_json::json!({"agentType": ty, "description": desc}).to_string()).unwrap();
+    }
+    assert!(gopola(&w, &["index"]).0);
+
+    let (ok, out, err) = gopola(&w, &["weight", "eeee7777", "--agents", "--json"]);
+    assert!(ok, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let a = v["agents"].as_array().unwrap();
+    let got: Vec<(&str, &str, u64, u64, u64)> = a.iter().map(|x| (x["agent"].as_str().unwrap(), x["type"].as_str().unwrap(),
+        x["calls"].as_u64().unwrap(), x["first_context"].as_u64().unwrap(), x["max"].as_u64().unwrap())).collect();
+    assert_eq!(got, [("b2", "worker", 2, 48283, 52000), ("a1", "general-purpose", 2, 59862, 70000)], "start order, one call per message id: {out}");
+    assert_eq!((a[0]["description"].as_str(), a[0]["output_tokens"].as_u64()), (Some("Review the thing"), Some(14)));
+    let (_, out, _) = gopola(&w, &["weight", "eeee7777", "--agents"]);
+    assert!(out.lines().any(|l| l.contains("b2") && l.contains("worker") && l.contains("48283") && l.contains("Review the thing")), "{out}");
+    let (_, plain, _) = gopola(&w, &["weight", "eeee7777", "--json"]);
+    assert!(serde_json::from_str::<serde_json::Value>(&plain).unwrap().get("agents").is_none(), "only on request: {plain}");
+
+    // A Workflow agent's transcript sits a folder deeper, and is all sidechain records too.
+    let deeper = sub.join("workflows/wf_1");
+    fs::create_dir_all(&deeper).unwrap();
+    fs::copy(sub.join("agent-b2.jsonl"), deeper.join("agent-c3.jsonl")).unwrap();
+    let (ok, out, err) = gopola(&w, &["weight", &deeper.join("agent-c3.jsonl").to_string_lossy()]);
+    assert!(ok && out.contains("model calls  2") && out.contains("first 48k"), "a subagent file measures its own calls: {out}{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
 fn bash_use(ts: &str, id: &str, name: &str, cmd: &str) -> String {
     serde_json::json!({"type": "assistant", "timestamp": ts, "message": {"role": "assistant",
         "content": [{"type": "tool_use", "id": id, "name": name, "input": {"command": cmd}}]}}).to_string()
@@ -1782,6 +1865,13 @@ fn commands_lists_bash_calls_with_status_output_and_subagents() {
     assert!(out.contains("agent abc123") && out.contains("exit 2") && out.contains("$ open -a Docker; say \"hi\"") && out.contains("line 40"), "{out}");
     let (_, out, _) = gopola(&w, &["commands", "eeee5555", "--head", "1"]);
     assert!(out.contains("line 1\n") && !out.contains("line 2\n") && out.contains("… 39 more lines"), "cut only on request: {out}");
+    // 2026-11-12, a client session: a command's output held storage keys, so only the command text could be kept.
+    let (_, out, _) = gopola(&w, &["commands", "eeee5555", "--no-output"]);
+    assert!(out.contains("$ open -a Docker") && out.contains("exit 2") && !out.contains("line 1") && !out.contains("more lines")
+        && !out.contains("\nboom") && !out.contains("[redacted"), "{out}");
+    let (_, out, _) = gopola(&w, &["commands", "eeee5555", "--no-output", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["commands"].as_array().unwrap().iter().all(|x| x.get("output").is_none() && x["command"].is_string()), "{out}");
 
     let exact = |g: &str| -> Vec<String> {
         let (_, out, _) = gopola(&w, &["commands", "eeee5555", "--grep", g, "--json"]);

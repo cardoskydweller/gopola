@@ -5,7 +5,7 @@ Every command, what it prints, and how it gets its facts. The [README](../README
 - [Setup](#setup): install, hooks, `doctor`, the skill
 - [The index](#the-index): what is stored, privacy, projects, [Copilot CLI](#copilot-cli), [Codex CLI](#codex-cli),
   [the tables](#the-tables)
-- [Finding past work](#finding-past-work): `search`, `show`, `timeline`, `recent`, `file`, `digest`, `tools`
+- [Finding past work](#finding-past-work): `search`, `show`, `timeline`, `recent`, `file`, `digest`, `tools`, `skills`
 - [Inside a session](#inside-a-session): `commands`, `dispatches`, `hooks`, `handback`, `weight`
 - [Code from sessions](#code-from-sessions): `authored`, `blame`
 - [Model calls](#model-calls): `summarize`, `embed`
@@ -127,7 +127,7 @@ Checks, one line each:
 - searches that found nothing in the last 30 days, and long sessions with no summary.
 
 gopola logs every query command locally: `search`, `recent`, `show`, `file` (and `file --hook`), `timeline` (and
-`timeline --query`), `tools`, `digest`, `commands`, `dispatches`, `hooks`, `weight`, `authored`, `blame` and `embed`. It logs
+`timeline --query`), `tools`, `skills`, `digest`, `commands`, `dispatches`, `hooks`, `weight`, `authored`, `blame` and `embed`. It logs
 the command, its argument and the hit count; nothing leaves the machine. `doctor` reads that log to show what gopola failed to
 answer.
 
@@ -464,14 +464,25 @@ that Bash commands ran instead: the first word of each simple command, after var
 as `sudo`, `env` and `xargs`. Quoted text, heredoc bodies, shell keywords and skill calls are not counted. A program
 repeated within one turn counts once.
 
+### `skills`
+
+    gopola skills [<name>...] [--project P] [--since D] [--until D]
+
+Counts the Skill tool calls by skill name, in all projects unless `--project` names one. Each row shows the calls, the
+sessions, the `/<name>` turns (`slash`), the first and last date, and the projects. A turn that calls a skill counts
+once. A `/<name>` command runs the skill with no Skill call, so it has its own column. A plugin's skill
+(`superpowers:writing-skills`) is a different name from a plain one. Without names, every skill with a call is shown.
+With names, exactly those names are shown, also with zero calls. Skill calls in subagent transcripts are not counted:
+the index does not read them.
+
 ## Inside a session
 
 These commands read the transcripts when you run them. They add nothing to the index.
 
 ### `commands`
 
-    gopola commands <session> [--grep <text>] [--head N]
-    gopola commands --grep <text> [--project P|all] [--since D] [--until D] [--head N]
+    gopola commands <session> [--grep <text>] [--head N] [--no-output]
+    gopola commands --grep <text> [--project P|all] [--since D] [--until D] [--head N] [--no-output]
 
 Each Bash call, in full: the time of the call, the session, the source (`session` or `agent <id>`), the status,
 the time of the result, the command and the output.
@@ -479,6 +490,8 @@ the time of the result, the command and the output.
 - `--grep` keeps the calls whose command contains the text exactly (case-sensitive). Without a session, `--grep` is
   required and every session of the project in the date range is read.
 - `--head N` cuts each output to N lines and says how many it cut. Nothing is cut without it.
+- `--no-output` prints no output, also with `--json`. Use it when you keep the commands and an output can hold a
+  secret.
 - Subagents' calls are included, from their own transcripts.
 - A large output that Claude Code saved to a file is printed from that file; if the file is gone, from the 2 KB
   preview in the transcript.
@@ -649,7 +662,7 @@ A notification that only says the report was delivered as a message holds no rep
 
 ### `weight`
 
-    gopola weight <session | transcript.jsonl> [-n 8]
+    gopola weight <session | transcript.jsonl> [-n 8] [--agents]
 
 Why a session got slow, and what filled its context: the context each model call carried, when compaction fired,
 and what started each turn. It reads the transcript directly, so it works on a session that is not yet indexed.
@@ -697,6 +710,12 @@ A job moved to the background starts with a copy of the session it came from, so
 not add up the parts of two chains.
 
 `--json` adds `quiet_s`, `duration_ms` and `idle` per compaction, and `chain: {id, parts: […]}` or `null`.
+
+**Subagents.** `--agents` adds one row per subagent transcript (`<session>/subagents/agent-<id>.jsonl`, or gopola's copy
+of it): the agent id, its calls, its first call in tokens, its median and maximum context, its output tokens, and the
+`agentType` and `description` from `agent-<id>.meta.json`. The rows are in start order. The first call is exact,
+because agent types differ there by less than 1k. With `--json`, the same rows are in `agents`. Give `weight` the path
+of one subagent transcript to measure only that agent.
 
 **Copilot CLI.** For a Copilot session, `weight` reads only its `events.jsonl`; it never prints prompt, system, reasoning,
 tool-argument, error or file content. The report has a segment for the start and each resume, preserving the cap from

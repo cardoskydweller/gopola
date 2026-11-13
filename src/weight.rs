@@ -88,7 +88,8 @@ fn origin_of(v: &Value) -> Option<String> {
     }
 }
 
-fn measure(r: impl BufRead) -> Weight {
+/// `sidechain`: a subagent's own transcript, where every record is marked `isSidechain`.
+fn measure(r: impl BufRead, sidechain: bool) -> Weight {
     let mut w = Weight::default();
     let mut seen: HashSet<String> = HashSet::new();
     let mut names: HashMap<String, String> = HashMap::new();
@@ -96,7 +97,7 @@ fn measure(r: impl BufRead) -> Weight {
     let mut current = "before the first prompt".to_string();
     for line in r.lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) { continue }
+        if !sidechain && v.get("isSidechain").and_then(Value::as_bool) == Some(true) { continue }
         // Earliest and latest, not first and last: a teleported copy opens with records stamped when it was copied.
         if let Some(ts) = v.get("timestamp").and_then(Value::as_str) {
             if w.first_ts.is_empty() || ts < w.first_ts.as_str() { w.first_ts = ts.to_string() }
@@ -218,7 +219,7 @@ fn chain_parts(path: &str) -> Option<(String, Vec<(String, Weight)>)> {
     let mut parts: Vec<(String, Weight)> = crate::archive::list(dir).into_iter()
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl") && modified(p) >= since)
         .filter(|p| chain_of(p).as_deref() == Some(chain.as_str()))
-        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), measure(crate::archive::open(&p).ok()?))))
+        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), measure(crate::archive::open(&p).ok()?, false))))
         .collect();
     parts.sort_by(|a, b| a.1.first_ts.cmp(&b.1.first_ts));
     (parts.len() > 1).then_some((chain, parts))
@@ -736,7 +737,16 @@ pub fn weight(o: &Opts, arg: &str) -> Res {
         (id, project, path)
     };
     let f = crate::archive::open(std::path::Path::new(&path)).map_err(|e| format!("{path}: {e}"))?;
-    let w = measure(f);
+    let w = measure(f, std::path::Path::new(&path).components().any(|c| c.as_os_str() == "subagents"));
+    // Each subagent's transcript beside the session's, with its type and description from `agent-<id>.meta.json`.
+    let mut agents: Vec<(String, Value, Weight)> = if o.agents {
+        crate::commands::session_files(&id, &path).into_iter().filter_map(|(_, p, agent)| {
+            let meta = crate::archive::read(&p.with_extension("meta.json")).ok()
+                .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+            Some((agent?, meta, measure(crate::archive::open(&p).ok()?, true)))
+        }).collect()
+    } else { vec![] };
+    agents.sort_by(|a, b| a.2.first_ts.cmp(&b.2.first_ts));
     let mut sorted = w.contexts.clone();
     sorted.sort_unstable();
     let mut tools: Vec<(&String, &Tool)> = w.tools.iter().collect();
@@ -750,8 +760,16 @@ pub fn weight(o: &Opts, arg: &str) -> Res {
             "idle_compactions": p.compactions.iter().filter(|c| c.idle()).count()})
     };
 
+    let agent_json = |(agent, meta, a): &(String, Value, Weight)| {
+        let mut s = a.contexts.clone();
+        s.sort_unstable();
+        json!({"agent": agent, "type": meta["agentType"], "description": meta["description"], "first": a.first_ts, "last": a.last_ts,
+            "calls": s.len(), "first_context": a.contexts.first().copied().unwrap_or(0), "median": pct(&s, 0.5),
+            "max": s.last().copied().unwrap_or(0), "output_tokens": a.output})
+    };
+
     if o.json {
-        println!("{}", json!({
+        let mut v = json!({
             "id": id, "project": project, "first": w.first_ts, "last": w.last_ts,
             "calls": sorted.len(), "context": {"first": w.contexts.first().copied().unwrap_or(0), "median": pct(&sorted, 0.5), "p90": pct(&sorted, 0.9), "max": sorted.last().copied().unwrap_or(0),
                 "processed": sorted.iter().sum::<u64>()},
@@ -762,7 +780,9 @@ pub fn weight(o: &Opts, arg: &str) -> Res {
             "tools": tools.iter().map(|(k, t)| json!({"tool": k, "calls": t.calls, "bytes": t.bytes, "images": t.images})).collect::<Vec<_>>(),
             "hook_bytes": w.hook_bytes, "prompt_images": w.prompt_images,
             "chain": chain.as_ref().map(|(c, parts)| json!({"id": c, "parts": parts.iter().map(part).collect::<Vec<_>>()})),
-        }));
+        });
+        if o.agents { v["agents"] = agents.iter().map(agent_json).collect() }
+        println!("{v}");
         return Ok(());
     }
 
@@ -781,8 +801,19 @@ pub fn weight(o: &Opts, arg: &str) -> Res {
         }
         println!();
     }
+    let print_agents = || if o.agents {
+        // The first call exactly: agent types are compared by it, and they differ by less than 1k.
+        println!("\nagents ({})          calls   first call  median     max  output  type  description", agents.len());
+        for a in &agents {
+            let v = agent_json(a);
+            let u = |k: &str| v[k].as_u64().unwrap_or(0);
+            println!("  {:<18} {:>6}  {:>11}  {:>6}  {:>6}  {:>6}  {}  {}", a.0, u("calls"), u("first_context"), tok(u("median")),
+                tok(u("max")), tok(u("output_tokens")), v["type"].as_str().unwrap_or("?"), v["description"].as_str().unwrap_or(""));
+        }
+    };
     if sorted.is_empty() {
         println!("no model calls with usage recorded");
+        print_agents();
         return Ok(());
     }
     println!("model calls  {}   context per call: first {}  median {}  p90 {}  max {}   output {}",
@@ -813,6 +844,7 @@ pub fn weight(o: &Opts, arg: &str) -> Res {
     }
     let img = if w.prompt_images > 0 { format!("   images in prompts: {}", w.prompt_images) } else { String::new() };
     println!("\ninjected by hooks  ~{}{img}", tok(w.hook_bytes / 4));
+    print_agents();
     Ok(())
 }
 
@@ -834,7 +866,7 @@ mod tests {
             r#"{"type":"attachment","attachment":{"type":"hook_success","content":"","stdout":"this is recorded, never sent"},"timestamp":"2026-10-10T11:00:01Z"}"#,
             r#"{"type":"attachment","attachment":{"type":"hook_success","content":"abcd","stdout":"{\"hookSpecificOutput\":{\"additionalContext\":\"12345678\"}}"},"timestamp":"2026-10-10T11:00:02Z"}"#,
         ].join("\n");
-        let w = measure(std::io::Cursor::new(lines));
+        let w = measure(std::io::Cursor::new(lines), false);
         assert_eq!(w.contexts, vec![1002, 2000], "m1 once, sidechain skipped");
         assert_eq!(w.output, 13);
         assert_eq!(w.origins["human"].calls, 1);
@@ -857,7 +889,7 @@ mod tests {
             r#"{"type":"user","message":{"content":"hello"}}"#,
             r#"{"type":"assistant","message":{"id":"b","usage":{"input_tokens":20}}}"#,
         ].join("\n");
-        let w = measure(std::io::Cursor::new(lines));
+        let w = measure(std::io::Cursor::new(lines), false);
         assert_eq!(w.origins["task_notification"].processed, 10);
         assert_eq!(w.origins["human"].processed, 20);
         assert_eq!(w.origins["human"].turns, 1, "the meta record is not a turn");
@@ -870,7 +902,7 @@ mod tests {
             r#"{"type":"user","message":{"content":"plan it"},"timestamp":"2026-10-16T14:22:30Z"}"#,
             r#"{"type":"assistant","message":{"id":"a","usage":{"input_tokens":1}},"timestamp":"2026-10-16T22:04:39Z"}"#,
         ].join("\n");
-        let w = measure(std::io::Cursor::new(lines));
+        let w = measure(std::io::Cursor::new(lines), false);
         assert_eq!((w.first_ts.as_str(), w.last_ts.as_str()), ("2026-10-16T14:22:30Z", "2026-10-26T10:50:42Z"));
     }
 
@@ -888,7 +920,7 @@ mod tests {
             r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"p2","compactMetadata":{"trigger":"auto","preTokens":477187,"postTokens":28945,"durationMs":86},"timestamp":"2026-10-27T14:02:33.157Z"}"#,
             r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"elsewhere","compactMetadata":{"trigger":"auto","preTokens":510815,"postTokens":30000,"durationMs":84224},"timestamp":"2026-10-12T14:33:36.000Z"}"#,
         ].join("\n");
-        let w = measure(std::io::Cursor::new(lines));
+        let w = measure(std::io::Cursor::new(lines), false);
         let c = &w.compactions;
         assert_eq!((c[0].quiet, c[0].duration_ms, c[0].idle()), (Some(3086 - 44), 44198, true), "51m26s gap, 44s of it compacting");
         assert_eq!((c[1].quiet, c[1].idle()), (Some(9), false));

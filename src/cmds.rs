@@ -46,6 +46,8 @@ pub struct Opts {
     pub all: bool,
     pub exclude: Option<String>,
     pub install: Option<String>,
+    pub no_output: bool,
+    pub agents: bool,
 }
 
 /// A session this long is worth a summary; below it, the block speaks for itself.
