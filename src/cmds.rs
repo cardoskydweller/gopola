@@ -540,12 +540,11 @@ pub fn codex_install(bin: &str) -> Res {
         println!("left {} alone, unchanged", path.display());
         return Ok(());
     }
-    let target = match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(&path)?,
-        Ok(_) => path.clone(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.clone(),
-        Err(e) => return Err(e.into()),
-    };
+    // A link is written through, also to a target not yet there; a link cycle was refused by the read above.
+    let mut target = path.clone();
+    while std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink()) {
+        target = target.with_file_name(std::fs::read_link(&target)?);
+    }
     // Written beside the target, then renamed: a write cut short never leaves the owner's hooks half a file.
     write_codex_hooks(&target, &(serde_json::to_string_pretty(&new)? + "\n"))?;
     println!("wrote {} (Codex SessionStart hook)", path.display());

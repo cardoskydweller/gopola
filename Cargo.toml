@@ -1,6 +1,6 @@
 [package]
 name = "gopola"
-version = "0.18.2"
+version = "0.18.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 regex = "1.13.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde_json = "1.0.151"
+toml = { version = "1.2.1", default-features = false, features = ["parse", "serde"] }
 ureq = { version = "3.4.2", default-features = false, features = ["json"] }
 zstd = "0.14.3"
 
@@ -18,5 +19,7 @@ zstd = "0.14.3"
 # What `toolship mirror` publishes to the public repo; every other path (docs/board.md, docs/roadmap.md,
 # docs/spec.md, docs/superpowers/, docs/VERSION-SWEEP-compiled.md) stays in this private workspace.
 [package.metadata.toolship]
+# Release binaries come from the public repo's release workflow (attested), never from a local build.
+attested = "cardoskydweller/gopola"
 public = [".github", ".gitignore", "CHANGELOG.md", "Cargo.lock", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT",
   "README.md", "demo", "docs/parity.md", "docs/reference.md", "install.sh", "skills", "src", "tests"]

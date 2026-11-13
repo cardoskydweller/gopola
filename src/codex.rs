@@ -71,12 +71,14 @@ pub fn classify(line: &str) -> Parsed {
                 [_, "-lc" | "-c", script] => script.to_string(),
                 _ => argv.join(" "),
             };
-            // `parsed_cmd` is Codex's own reading of the command; a read's path is relative to the command's `cwd`.
-            let dir = url_path(item["cwd"].as_str().unwrap_or(""));
+            // `parsed_cmd` is Codex's own reading of the command; a read's path is relative to the command's `cwd`,
+            // and with no `cwd` a relative path names no file.
+            let dir = item["cwd"].as_str().filter(|c| !c.is_empty()).map(|c| url_path(c).unwrap_or_else(|| c.into()));
             let reads = item["parsed_cmd"].as_array().into_iter().flatten()
                 .filter(|c| c["type"] == "read")
                 .filter_map(|c| c["path"].as_str())
-                .map(|path| Path::new(&dir).join(path).to_string_lossy().into_owned())
+                .filter(|path| dir.is_some() || Path::new(path).is_absolute())
+                .map(|path| Path::new(dir.as_deref().unwrap_or("")).join(path).to_string_lossy().into_owned())
                 .collect();
             let (tools, commands) = (vec!["exec_command".to_string()], vec![strip_private(&command)]);
             Parsed::Event(Event::Reply { ts, text: None, files: vec![], tools, reads, commands })
@@ -98,9 +100,9 @@ fn joined(item: &Value, block_type: &str) -> Option<String> {
     Some(blocks.iter().filter(|b| b["type"] == block_type).filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"))
 }
 
-/// The path of a `file://` URL, `%XX` escapes decoded (a space, a non-ASCII name).
-fn url_path(url: &str) -> String {
-    let s = url.strip_prefix("file://").unwrap_or(url).as_bytes();
+/// The path of a `file://` URL, `%XX` escapes decoded (a space, a non-ASCII name); `None` for anything else.
+fn url_path(url: &str) -> Option<String> {
+    let s = url.strip_prefix("file://")?.as_bytes();
     let hex = |b: Option<&u8>| b.and_then(|&b| (b as char).to_digit(16));
     let (mut out, mut i) = (Vec::with_capacity(s.len()), 0);
     while i < s.len() {
@@ -115,7 +117,7 @@ fn url_path(url: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -279,6 +281,22 @@ mod tests {
             let l = item(&format!(r#"{{"type":"CommandExecution","id":"c","command":["/bin/zsh","-lc","cat README.md"],"cwd":"{cwd}","parsed_cmd":[{{"type":"read","cmd":"cat README.md","name":"README.md","path":"README.md"}}]}}"#));
             match classify(&l) {
                 Parsed::Event(Event::Reply { reads, .. }) => assert_eq!(reads, vec![want]),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn read_path_without_a_file_url_cwd() {
+        for (cwd, path, want) in [
+            (r#","cwd":"/work/demo%20app""#, "README.md", vec!["/work/demo%20app/README.md"]),
+            ("", "README.md", vec![]),
+            (r#","cwd":"""#, "README.md", vec![]),
+            ("", "/work/demo/README.md", vec!["/work/demo/README.md"]),
+        ] {
+            let l = item(&format!(r#"{{"type":"CommandExecution","id":"c","command":["/bin/zsh","-lc","cat x"]{cwd},"parsed_cmd":[{{"type":"read","cmd":"cat x","name":"x","path":"{path}"}}]}}"#));
+            match classify(&l) {
+                Parsed::Event(Event::Reply { reads, .. }) => assert_eq!(reads, want, "{cwd} {path}"),
                 other => panic!("{other:?}"),
             }
         }

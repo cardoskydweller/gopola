@@ -2435,18 +2435,22 @@ fn index_propagates_codex_title_row_conversion_errors() {
     let w = setup();
     codex_rollout(&w, CX_TUI, "tui-0.167.0.jsonl", &w.repo);
     assert!(gopola(&w, &["index"]).0);
+    rusqlite::Connection::open(&w.db)
+        .unwrap()
+        .execute("update sessions set project = cast(x'01' as blob) where id = ?1", [CX_TUI])
+        .unwrap();
+    // Only the title query reads `session_index.jsonl`: without it the same row passes.
+    let (ok, _, err) = gopola(&w, &["index"]);
+    assert!(ok, "{err}");
     fs::write(
         w.base.join("codex/session_index.jsonl"),
         format!(r#"{{"id":"{CX_TUI}","thread_name":"demo title"}}"#),
     )
     .unwrap();
-    rusqlite::Connection::open(&w.db)
-        .unwrap()
-        .execute("update sessions set project = cast(x'01' as blob) where id = ?1", [CX_TUI])
-        .unwrap();
 
+    // `index` exits 0 so a hook never blocks; the error is on stderr.
     let (_, _, err) = gopola(&w, &["index"]);
-    assert!(err.contains("Invalid column type"), "{err}");
+    assert!(err.contains("Invalid column type Blob at index: 1, name: project"), "{err}");
     fs::remove_dir_all(&w.base).unwrap();
 }
 
@@ -2555,6 +2559,8 @@ fn codex_archived_rollout_keeps_one_row() {
     fs::create_dir_all(moved.parent().unwrap()).unwrap();
     fs::copy(&f, &moved).unwrap();
     assert_eq!(files_seen(&w), (1.into(), String::new()), "both places hold it: one session");
+    assert!(gopola(&w, &["index", "--full"]).0);
+    assert_eq!(codex_rows(&w), vec![(CX.to_string(), f.to_string_lossy().to_string())], "sessions/ is read first");
     fs::remove_file(&f).unwrap();
     assert_eq!(files_seen(&w), (1.into(), String::new()));
     assert_eq!(codex_rows(&w), vec![(CX.to_string(), moved.to_string_lossy().to_string())]);
@@ -3376,8 +3382,18 @@ fn doctor_reports_codex() {
     fs::remove_file(w.base.join("codex/hooks.json")).unwrap();
     fs::write(w.base.join("codex/config.toml"), "# gopola codex-hook\n[hooks.OtherEvent]\ncommand = \"gopola codex-hook\"\n").unwrap();
     assert!(gopola(&w, &["doctor"]).1.contains("fix   Codex SessionStart hook missing"));
+    // SessionStart is a list of matcher groups: alone, `[[hooks.SessionStart.hooks]]` makes it a table.
     fs::write(w.base.join("codex/config.toml"), "[[hooks.SessionStart.hooks]]\ntype = \"command\"\ncommand = \"gopola codex-hook\"\n").unwrap();
-    assert!(gopola(&w, &["doctor"]).1.contains("ok    Codex SessionStart hook wired"));
+    assert!(gopola(&w, &["doctor"]).1.contains("fix   Codex SessionStart hook missing"));
+    fs::write(w.base.join("codex/config.toml"), "[[hooks.SessionStart]]\n[[hooks.SessionStart.hooks]]\ncommand = \"gopola codex-hook\"\nbroken = [\n").unwrap();
+    assert!(gopola(&w, &["doctor"]).1.contains("fix   Codex SessionStart hook missing"), "not TOML: not wired");
+    for toml in [
+        "[[hooks.SessionStart]]\n[[hooks.SessionStart.hooks]]\ntype = \"command\"\ncommand = \"gopola codex-hook\"\n",
+        "[hooks]\nSessionStart = [{ hooks = [{ type = \"command\", command = \"gopola codex-hook\" }] }]\n",
+    ] {
+        fs::write(w.base.join("codex/config.toml"), toml).unwrap();
+        assert!(gopola(&w, &["doctor"]).1.contains("ok    Codex SessionStart hook wired"), "{toml}");
+    }
 
     fs::write(&f, fs::read_to_string(&f).unwrap() + r#"{"timestamp":"2026-03-02T09:07:00.000Z","type":"compacted","payload":{"message":"demo summary"}}"# + "\n").unwrap();
     assert!(gopola(&w, &["doctor"]).1.contains("fix   1 transcript(s) changed since the last index"));
@@ -3701,6 +3717,20 @@ fn codex_hook_install_keeps_a_hooks_json_symlink() {
     assert!(ok, "{err}");
     assert!(fs::symlink_metadata(&hooks).unwrap().file_type().is_symlink());
     assert!(fs::read_to_string(&target).unwrap().contains("gopola codex-hook"));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn codex_hook_install_writes_through_a_link_to_a_missing_file() {
+    let w = setup();
+    let hooks = w.base.join("codex/hooks.json");
+    fs::create_dir_all(w.base.join("codex/dotfiles")).unwrap();
+    std::os::unix::fs::symlink("dotfiles/hooks.json", &hooks).unwrap();
+
+    let (ok, _, err) = gopola(&w, &["codex-hook", "--install", "/demo/bin"]);
+    assert!(ok, "{err}");
+    assert!(fs::symlink_metadata(&hooks).unwrap().file_type().is_symlink());
+    assert!(fs::read_to_string(w.base.join("codex/dotfiles/hooks.json")).unwrap().contains("gopola codex-hook"));
     fs::remove_dir_all(&w.base).unwrap();
 }
 
