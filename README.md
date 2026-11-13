@@ -68,6 +68,12 @@ Or, without the skill:
 
     cargo install --git https://github.com/cardoskydweller/gopola --locked
 
+Or download a binary and `SHA256SUMS` from the [Releases page](https://github.com/cardoskydweller/gopola/releases).
+Each binary is built by the release workflow from the public source; check it before you run it:
+
+    gh attestation verify gopola-<version>-<target> --repo cardoskydweller/gopola
+    shasum -a 256 -c SHA256SUMS --ignore-missing
+
 Then build the index once and check the setup:
 
     gopola index
