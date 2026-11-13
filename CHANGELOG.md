@@ -3,6 +3,15 @@
 What changed in each version, and why. Every feature here was built after a real question went unanswered, so each
 entry names the question.
 
+## 0.18.3 — 2026-11-13
+
+**Fixes from review.** `doctor` reads Codex's `config.toml` as TOML, so a `SessionStart` hook written as an inline
+table counts as wired, and a lone `[[hooks.SessionStart.hooks]]` (a table, not the list of matcher groups Codex reads)
+does not. `codex-hook --install` writes through a `hooks.json` link whose target does not exist yet, keeping the link.
+A Codex read path that is relative and has no `cwd` is dropped (it named no file), and only a `file://` cwd is
+%-decoded. New tests: the `sessions/` copy of a rollout wins over its `archived_sessions/` copy, and the title query is
+the one that reports a bad row. New dependency: `toml` (parse and serde only).
+
 ## 0.18.2 — 2026-11-13
 
 **New: release binaries are built in the public repo.** A binary built on a Mac named a private commit, so nobody could

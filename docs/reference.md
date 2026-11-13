@@ -118,8 +118,8 @@ Checks, one line each:
   record, which makes that session indexed as nothing), how many lines of a known type gopola cannot read, per
   session (a field Copilot renamed shows here; a last line with no newline yet is not counted), and how many Copilot sessions there are, by
   the CLI version each started on (a resumed session keeps its first version);
-- when the Codex folder exists, the same four lines for Codex: whether `hooks.json` or `config.toml` in it runs
-  `gopola codex-hook` (`Codex SessionStart hook wired` or `missing`), the record types in Codex rollouts that gopola
+- when the Codex folder exists, the same four lines for Codex: whether a `SessionStart` handler in `hooks.json` or
+  `config.toml` (any TOML form) runs `gopola codex-hook` (`Codex SessionStart hook wired` or `missing`), the record types in Codex rollouts that gopola
   does not know (a subagent's rollout shows here as `subagent.session_meta`), the lines of a known type gopola cannot
   read, per session, and how many Codex sessions there are, by CLI version. A rollout Codex has compressed is read
   through; one that only gopola's archive still holds is left out;

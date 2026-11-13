@@ -295,33 +295,16 @@ fn programs(cmd: &str) -> Vec<String> {
     out
 }
 
+/// Codex reads the same matcher groups from `hooks.json` and from `[hooks]` in `config.toml`.
 fn codex_hook_wired(home: &std::path::Path) -> bool {
-    let json = std::fs::read_to_string(home.join("hooks.json")).is_ok_and(|text| {
-        serde_json::from_str::<Value>(&text).is_ok_and(|v| {
-            v["hooks"]["SessionStart"].as_array().is_some_and(|groups| groups.iter().any(|g| {
-                g["hooks"].as_array().is_some_and(|hooks| hooks.iter().any(|h| {
-                    h["command"].as_str().is_some_and(|c| c.contains("gopola codex-hook"))
-                }))
-            }))
-        })
-    });
-    let config = std::fs::read_to_string(home.join("config.toml")).is_ok_and(|text| {
-        let mut session_start = false;
-        text.lines().any(|line| {
-            let line = line.trim();
-            if line.starts_with('[') {
-                session_start = line == "[[hooks.SessionStart.hooks]]";
-                return false;
-            }
-            if !session_start { return false }
-            let Some((key, value)) = line.split_once('=') else { return false };
-            let value = value.trim();
-            let Some(quote @ ('"' | '\'')) = value.chars().next() else { return false };
-            value.strip_prefix(quote).and_then(|v| v.split(quote).next())
-                .is_some_and(|command| key.trim() == "command" && command.contains("gopola codex-hook"))
-        })
-    });
-    json || config
+    let wired = |v: Value| v["hooks"]["SessionStart"].as_array().is_some_and(|groups| groups.iter().any(|g| {
+        g["hooks"].as_array().is_some_and(|hooks| hooks.iter().any(|h| {
+            h["command"].as_str().is_some_and(|c| c.contains("gopola codex-hook"))
+        }))
+    }));
+    let read = |name: &str| std::fs::read_to_string(home.join(name)).ok();
+    read("hooks.json").and_then(|t| serde_json::from_str(&t).ok()).is_some_and(wired)
+        || read("config.toml").and_then(|t| toml::from_str(&t).ok()).is_some_and(wired)
 }
 
 #[cfg(test)]
