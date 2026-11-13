@@ -2422,10 +2422,46 @@ fn archive_keeps_codex_rollouts() {
     assert_eq!(unzstd(&copy), fs::read(&f).unwrap());
     assert_eq!(files_seen(&w), (1.into(), String::new()), "the rollout and its copy are one session");
     fs::remove_file(&f).unwrap();
-    let (ok, _, err) = gopola(&w, &["index", "--full"]);
+    let (ok, out, err) = gopola(&w, &["index", "--full", "--json"]);
     assert!(ok && err.is_empty(), "{err}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["turns_written"], 2, "{out}");
     assert_eq!(codex_rows(&w), vec![(CX.to_string(), f.to_string_lossy().to_string())]);
     assert_eq!(show_json(&w, CX)["turns"], before);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn index_propagates_codex_title_row_conversion_errors() {
+    let w = setup();
+    codex_rollout(&w, CX_TUI, "tui-0.167.0.jsonl", &w.repo);
+    assert!(gopola(&w, &["index"]).0);
+    fs::write(
+        w.base.join("codex/session_index.jsonl"),
+        format!(r#"{{"id":"{CX_TUI}","thread_name":"demo title"}}"#),
+    )
+    .unwrap();
+    rusqlite::Connection::open(&w.db)
+        .unwrap()
+        .execute("update sessions set project = cast(x'01' as blob) where id = ?1", [CX_TUI])
+        .unwrap();
+
+    let (_, _, err) = gopola(&w, &["index"]);
+    assert!(err.contains("Invalid column type"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn doctor_detects_a_codex_rollout_grown_before_compression() {
+    use std::io::Write;
+    let w = setup();
+    let f = codex_rollout(&w, CX, "exec-0.167.0.jsonl", &w.repo);
+    assert!(gopola(&w, &["index"]).0);
+    fs::OpenOptions::new().append(true).open(&f).unwrap().write_all(b"\n").unwrap();
+    codex_compress(&f);
+    fs::remove_file(&f).unwrap();
+
+    let (_, out, _) = gopola(&w, &["doctor"]);
+    assert!(out.contains("fix   1 transcript(s) changed since the last index"), "{out}");
     fs::remove_dir_all(&w.base).unwrap();
 }
 
@@ -2831,7 +2867,7 @@ fn copilot_weight_by_id_reports_segments_without_content() {
     assert_eq!(v["tool_calls"]["refusals"][0]["command"], "printf");
     assert_eq!(v["tool_calls"]["refusals"][1]["source"], "hook:zshguard");
     assert_eq!(v["tool_calls"]["refusals"][1]["rules"][0], "inplace");
-    assert_eq!(v["tool_calls"]["refusals"][1]["rules"], serde_json::json!(["inplace", "?", "?", "?", "?"]));
+    assert_eq!(v["tool_calls"]["refusals"][1]["rules"], serde_json::json!(["inplace", "?", "?", "?"]));
     assert_eq!(v["tool_calls"]["refusals"][2]["source"], "other");
     assert_eq!(v["tool_calls"]["refusals"][2]["command"], "");
     let fixture = fs::read_to_string(&f).unwrap();
@@ -2850,9 +2886,9 @@ fn copilot_weight_by_id_reports_segments_without_content() {
             assert!(ok, "{err}");
             let rules_ok = if args.contains(&"--json") {
                 let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-                v["tool_calls"]["refusals"][1]["rules"] == serde_json::json!(["inplace-redirect", "?", "?"])
+                v["tool_calls"]["refusals"][1]["rules"] == serde_json::json!(["inplace-redirect", "?"])
             } else {
-                out.contains("refusal hook:zshguard  command=printf  rules=inplace-redirect,?,?")
+                out.contains("refusal hook:zshguard  command=printf  rules=inplace-redirect,?")
             };
             if out.contains("gopola-weight-unique-secret-7391") || !rules_ok {
                 failures.push(format!("{name}: {args:?}"));
@@ -2873,7 +2909,7 @@ fn copilot_weight_reports_only_known_zshguard_rules() {
         "modifier", "equals", "nomatch", "for-scalar", "tied-var", "bfs-time", "pipestatus",
         "list-arg", "split-arg", "adb-stdin", "pipe-filter", "bg-filter", "pgrep-wait",
         "clean-guard", "inplace", "inplace-redirect", "alt-arg", "tools-filter", "switch-track",
-        "gh-auth-switch", "gh-wrong-account",
+        "gh-auth-switch", "gh-wrong-account", "git-grep-escape",
     ];
     let rules = known.iter().copied().chain(["future-rule", "Invalid_rule"]);
     let lines = rules.enumerate().map(|(i, rule)| format!("{}. [{rule}] refused\n", i + 1)).collect::<String>();
@@ -3330,12 +3366,16 @@ fn doctor_reports_codex() {
 
     fs::write(&f, fs::read_to_string(&f).unwrap() + r#"{"timestamp":"2026-03-02T09:06:00.000Z","type":"compacted","payload":{"message":"demo summary"}}"# + "\n").unwrap();
     assert!(gopola(&w, &["index"]).0);
+    fs::write(w.base.join("codex/hooks.json"), r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"gopola codex-hook"}]}]}}"#).unwrap();
+    assert!(gopola(&w, &["doctor"]).1.contains("fix   Codex SessionStart hook missing"));
     fs::write(w.base.join("codex/hooks.json"), r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$HOME/.local/bin/gopola codex-hook"}]}]}}"#).unwrap();
     let (_, out, _) = gopola(&w, &["doctor"]);
     assert!(out.contains("look  Codex record types gopola does not know: compacted (in 019cadc0)"), "{out}");
     assert!(out.contains("ok    Codex SessionStart hook wired"), "{out}");
     // Codex also takes hooks from `[hooks]` in config.toml.
     fs::remove_file(w.base.join("codex/hooks.json")).unwrap();
+    fs::write(w.base.join("codex/config.toml"), "# gopola codex-hook\n[hooks.OtherEvent]\ncommand = \"gopola codex-hook\"\n").unwrap();
+    assert!(gopola(&w, &["doctor"]).1.contains("fix   Codex SessionStart hook missing"));
     fs::write(w.base.join("codex/config.toml"), "[[hooks.SessionStart.hooks]]\ntype = \"command\"\ncommand = \"gopola codex-hook\"\n").unwrap();
     assert!(gopola(&w, &["doctor"]).1.contains("ok    Codex SessionStart hook wired"));
 
@@ -3644,6 +3684,23 @@ fn codex_hook_install_makes_the_bin_absolute() {
     let bin = Path::new(command.strip_prefix('\'').and_then(|c| c.strip_suffix("'/gopola codex-hook")).unwrap());
     assert!(bin.is_absolute() && bin.ends_with("bin"), "{command}");
     assert_eq!(fs::canonicalize(bin.parent().unwrap()).unwrap(), fs::canonicalize(&w.repo).unwrap(), "{command}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn codex_hook_install_keeps_a_hooks_json_symlink() {
+    use std::os::unix::fs::symlink;
+    let w = setup();
+    let hooks = w.base.join("codex/hooks.json");
+    let target = w.base.join("codex/real-hooks.json");
+    fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+    fs::write(&target, r#"{"hooks":{"SessionStart":[]}}"#).unwrap();
+    symlink(&target, &hooks).unwrap();
+
+    let (ok, _, err) = gopola(&w, &["codex-hook", "--install", "/demo/bin"]);
+    assert!(ok, "{err}");
+    assert!(fs::symlink_metadata(&hooks).unwrap().file_type().is_symlink());
+    assert!(fs::read_to_string(&target).unwrap().contains("gopola codex-hook"));
     fs::remove_dir_all(&w.base).unwrap();
 }
 

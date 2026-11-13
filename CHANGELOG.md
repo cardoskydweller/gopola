@@ -3,6 +3,13 @@
 What changed in each version, and why. Every feature here was built after a real question went unanswered, so each
 entry names the question.
 
+## 0.18.1 — 2026-11-13
+
+**Fixes from review.** Codex ignores declined file changes, reports compressed rollouts that changed after indexing,
+checks the actual SessionStart hook, preserves symlinked hook files, and cleans failed temporary writes. Index row
+conversion errors are surfaced. Copilot weight no longer counts numbered Markdown links as zshguard rules and
+recognizes `git-grep-escape`.
+
 ## 0.18.0 — 2026-11-12
 
 **New: `weight` for Copilot CLI sessions.** Copilot write seats need to be tuned from real runs, not test runs. `weight`

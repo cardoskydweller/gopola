@@ -208,3 +208,28 @@ pub fn archive_cmd(o: &Opts) -> Res {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zst_beside_a_non_codex_path_is_not_its_archive() {
+        let root = std::env::temp_dir().join(format!(
+            "gopola-archive-guard-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        let zst = zst(&path);
+        std::fs::write(&zst, zstd::stream::encode_all(&b"transcript"[..], 0).unwrap()).unwrap();
+
+        assert!(!path.starts_with(crate::index::codex_home()));
+        assert!(!exists(&path));
+        assert_eq!(modified(&path), None);
+        assert_eq!(size(&path), None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

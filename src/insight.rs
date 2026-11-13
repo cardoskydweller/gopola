@@ -295,6 +295,35 @@ fn programs(cmd: &str) -> Vec<String> {
     out
 }
 
+fn codex_hook_wired(home: &std::path::Path) -> bool {
+    let json = std::fs::read_to_string(home.join("hooks.json")).is_ok_and(|text| {
+        serde_json::from_str::<Value>(&text).is_ok_and(|v| {
+            v["hooks"]["SessionStart"].as_array().is_some_and(|groups| groups.iter().any(|g| {
+                g["hooks"].as_array().is_some_and(|hooks| hooks.iter().any(|h| {
+                    h["command"].as_str().is_some_and(|c| c.contains("gopola codex-hook"))
+                }))
+            }))
+        })
+    });
+    let config = std::fs::read_to_string(home.join("config.toml")).is_ok_and(|text| {
+        let mut session_start = false;
+        text.lines().any(|line| {
+            let line = line.trim();
+            if line.starts_with('[') {
+                session_start = line == "[[hooks.SessionStart.hooks]]";
+                return false;
+            }
+            if !session_start { return false }
+            let Some((key, value)) = line.split_once('=') else { return false };
+            let value = value.trim();
+            let Some(quote @ ('"' | '\'')) = value.chars().next() else { return false };
+            value.strip_prefix(quote).and_then(|v| v.split(quote).next())
+                .is_some_and(|command| key.trim() == "command" && command.contains("gopola codex-hook"))
+        })
+    });
+    json || config
+}
+
 #[cfg(test)]
 mod tests {
     use super::programs;
@@ -357,8 +386,7 @@ pub fn doctor(o: &Opts) -> Res {
     let codex = crate::index::codex_home();
     if codex.is_dir() {
         // Codex takes hooks from `hooks.json` beside `config.toml`, or from `[hooks]` in `config.toml`.
-        let wired = ["hooks.json", "config.toml"].iter()
-            .any(|f| std::fs::read_to_string(codex.join(f)).is_ok_and(|t| t.contains("gopola codex-hook")));
+        let wired = codex_hook_wired(&codex);
         findings.push(if wired { ("ok", "Codex SessionStart hook wired".into()) }
             else { ("fix", format!("Codex SessionStart hook missing: neither hooks.json nor config.toml in {} holds `gopola codex-hook`", codex.display())) });
         // Rollouts Codex still keeps, plain or as its own `.zst`; one Codex deleted, kept only in gopola's archive, is left out.
@@ -484,9 +512,10 @@ fn stale_transcripts(c: &Connection) -> usize {
         .filter(|(_, p)| p.parent().and_then(|d| d.file_name())
             .is_some_and(|id| crate::index::launch_dir(c, &id.to_string_lossy(), p, &[], crate::copilot::classify).is_some()))
         .count();
-    // Only a plain rollout can grow: Codex compresses one that has gone quiet, and gopola's copy is of a deleted one.
+    // Codex compresses quiet rollouts; compare their decompressed size and leave gopola's deleted-session copies out.
     stale += crate::index::codex_rollouts().into_iter()
-        .filter_map(|(p, id)| Some((p.metadata().ok()?.len() as i64, p, id)))
+        .filter(|(p, _)| crate::archive::live(p))
+        .filter_map(|(p, id)| Some((crate::archive::size(&p)? as i64, p, id)))
         .filter(|(size, p, _)| known.get(&p.to_string_lossy().to_string()) != Some(size))
         .filter(|(_, p, id)| crate::index::launch_dir(c, id, p, &[], crate::codex::classify).is_some())
         .count();

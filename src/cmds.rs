@@ -540,12 +540,56 @@ pub fn codex_install(bin: &str) -> Res {
         println!("left {} alone, unchanged", path.display());
         return Ok(());
     }
-    // Written beside it, then renamed: a write cut short never leaves the owner's hooks half a file.
-    let tmp = path.with_extension("json.gopola-tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&new)? + "\n")?;
-    std::fs::rename(&tmp, &path)?;
+    let target = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(&path)?,
+        Ok(_) => path.clone(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.clone(),
+        Err(e) => return Err(e.into()),
+    };
+    // Written beside the target, then renamed: a write cut short never leaves the owner's hooks half a file.
+    write_codex_hooks(&target, &(serde_json::to_string_pretty(&new)? + "\n"))?;
     println!("wrote {} (Codex SessionStart hook)", path.display());
     Ok(())
+}
+
+fn write_codex_hooks(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.gopola-tmp");
+    std::fs::write(&tmp, contents)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        return match std::fs::remove_file(&tmp) {
+            Ok(()) => Err(e),
+            Err(cleanup) => Err(std::io::Error::new(
+                e.kind(),
+                format!("{e}; could not remove {}: {cleanup}", tmp.display()),
+            )),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod codex_install_tests {
+    use super::*;
+
+    #[test]
+    fn failed_codex_hook_rename_removes_its_temp_file() {
+        let root = std::env::temp_dir().join(format!(
+            "gopola-codex-hook-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("hooks.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("existing"), "unchanged").unwrap();
+        let tmp = path.with_extension("json.gopola-tmp");
+
+        let failed = write_codex_hooks(&path, "{}").is_err();
+        let leftover = tmp.exists();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(failed);
+        assert!(!leftover);
+    }
 }
 
 /// Words and meaning as one ranking. Rows of one turn share a key, so the turn appears once, with the
