@@ -222,6 +222,57 @@ pub fn tools(o: &Opts) -> Res {
     Ok(())
 }
 
+/// `skills [<name>...]`: Skill tool calls by name, from the commands the index keeps as `Skill <name> …`, across every
+/// project unless `--project` names one. A turn that calls a skill counts once; `slash` counts turns opened by
+/// `/<name>`, which run the skill with no Skill call. No names: every name with a call; names: exactly those.
+pub fn skills(o: &Opts, names: &[String]) -> Res {
+    #[derive(Default)]
+    struct Row { calls: u64, slash: u64, sessions: std::collections::BTreeSet<String>, first: String, last: String,
+        projects: std::collections::BTreeSet<String> }
+    static SLASH: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"<command-name>/([^<\s]+)</command-name>").unwrap());
+    let c = crate::db::open()?;
+    let project = o.project.clone().unwrap_or_else(|| "all".into());
+    let mut st = c.prepare(
+        "select t.session_id, s.project, t.ts, coalesce(t.commands, '[]'), t.prompt from turns t join sessions s on s.id = t.session_id
+         where (s.project = ?1 or ?1 = 'all') and t.ts >= ?2 and t.ts < ?3")?;
+    let mut rows: std::collections::BTreeMap<String, Row> = names.iter().map(|n| (n.clone(), Row::default())).collect();
+    let mut slash: std::collections::HashMap<String, u64> = Default::default();
+    for r in st.query_map(params![project, o.since.clone().unwrap_or_default(), o.until.clone().unwrap_or_else(|| "9999".into())],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))? {
+        let (sid, proj, ts, cmds, prompt) = r?;
+        if let Some(m) = SLASH.captures(&prompt) { *slash.entry(m[1].to_string()).or_default() += 1 }
+        let mut called: Vec<String> = serde_json::from_str::<Vec<String>>(&cmds).unwrap_or_default().iter()
+            .filter_map(|c| c.strip_prefix("Skill ")?.split_whitespace().next().map(str::to_string)).collect();
+        called.sort();
+        called.dedup();
+        for name in called.into_iter().filter(|n| names.is_empty() || names.contains(n)) {
+            let row = rows.entry(name).or_default();
+            row.calls += 1;
+            row.sessions.insert(sid.clone());
+            row.projects.insert(proj.clone());
+            if row.first.is_empty() || ts < row.first { row.first = ts.clone() }
+            if ts > row.last { row.last = ts.clone() }
+        }
+    }
+    let mut rows: Vec<(String, Row)> = rows.into_iter().map(|(n, mut r)| { r.slash = slash.get(&n).copied().unwrap_or(0); (n, r) }).collect();
+    rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then(a.0.cmp(&b.0)));
+    crate::db::log_usage(&c, "skills", &project, rows.len() as i64);
+    let day = |ts: &str| ts.get(..10).unwrap_or("").to_string();
+    if o.json {
+        let v: Vec<Value> = rows.iter().map(|(n, r)| json!({"skill": n, "calls": r.calls, "sessions": r.sessions.len(), "slash": r.slash,
+            "first": day(&r.first), "last": day(&r.last), "projects": r.projects})).collect();
+        println!("{}", json!({"project": project, "skills": v}));
+        return Ok(());
+    }
+    println!("# skills in {project}: skill  calls  sessions  slash  first  last  projects");
+    for (n, r) in &rows {
+        let projects: Vec<&str> = r.projects.iter().map(String::as_str).collect();
+        println!("{n:<36} {:>6} {:>8} {:>6}  {:<10}  {:<10}  {}", r.calls, r.sessions.len(), r.slash, day(&r.first), day(&r.last), projects.join(", "));
+    }
+    Ok(())
+}
+
 /// `tools --programs`: each program the indexed Bash commands ran, by calls and sessions. A turn keeps a
 /// repeated command once, so a call is a distinct command in a turn.
 fn program_rows(c: &Connection, project: &str, since: &str, n: usize) -> rusqlite::Result<Vec<(String, i64, i64)>> {

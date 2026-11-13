@@ -143,9 +143,13 @@ pub fn commands(o: &Opts, session: Option<&str>) -> Res {
     crate::db::log_usage(&c, "commands", &format!("{scope}{}", needle.map(|g| format!(" --grep {g}")).unwrap_or_default()), calls.len() as i64);
 
     if o.json {
-        let list: Vec<Value> = calls.iter().map(|k| json!({"session": k.session, "source": if k.agent.is_some() { "agent" } else { "session" },
-            "agent": k.agent, "ts": k.ts, "result_ts": k.result_ts, "status": k.status, "exit": k.exit,
-            "command": redact_secrets(&k.command), "output": redact_secrets(&k.output)})).collect();
+        let list: Vec<Value> = calls.iter().map(|k| {
+            let mut v = json!({"session": k.session, "source": if k.agent.is_some() { "agent" } else { "session" },
+                "agent": k.agent, "ts": k.ts, "result_ts": k.result_ts, "status": k.status, "exit": k.exit,
+                "command": redact_secrets(&k.command)});
+            if !o.no_output { v["output"] = json!(redact_secrets(&k.output)) }
+            v
+        }).collect();
         println!("{}", json!({"scope": scope, "grep": needle, "sessions_read": rows.len(), "commands": list}));
         return Ok(());
     }
@@ -156,6 +160,7 @@ pub fn commands(o: &Opts, session: Option<&str>) -> Res {
         let source = k.agent.as_deref().map_or("session".to_string(), |a| format!("agent {a}"));
         let result = k.result_ts.as_deref().map(|t| format!("  → {}", when(t).get(11..).unwrap_or(""))).unwrap_or_default();
         println!("\n{}  {}  {source}  {}{result}\n$ {}", when(&k.ts), short_id(&k.session), k.status, redact_secrets(&k.command));
+        if o.no_output { continue }
         let output = redact_secrets(&k.output);
         let lines: Vec<&str> = output.lines().collect();
         let keep = o.head.unwrap_or(lines.len()).min(lines.len());

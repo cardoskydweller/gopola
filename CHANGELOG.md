@@ -3,6 +3,23 @@
 What changed in each version, and why. Every feature here was built after a real question went unanswered, so each
 entry names the question.
 
+## 0.19.0 — 2026-11-13
+
+**New: `weight --agents`.** The question: how big is each subagent's first call, by agent type? `weight` on a
+subagent's transcript printed "no model calls with usage recorded", so the sizes were read with a hand `jq`, three
+times in one session. `--agents` adds one row per subagent: calls, the first call exactly, median and maximum context,
+output, and the agent's type and description from its `.meta.json`. `weight` also measures a subagent transcript
+given by its path.
+
+**New: `commands --no-output`.** The question: can a session's commands be kept when their output holds a secret? Both
+views always printed the output, so the commands were read with `jq` over the transcript. `--no-output` prints none, in
+both views.
+
+**New: `skills [<name>...]`.** The question: how many times was a skill really called? A hand `search | rg -c` stopped
+at 10 rows without `-n 1000`, missed calls whose search snippet showed another match, and counted a command that
+only quoted the words. `skills` counts the Skill calls in the index by name, in all projects: calls (a turn counts
+once), sessions, `/<name>` turns apart, first and last date, and projects.
+
 ## 0.18.3 — 2026-11-13
 
 **Fixes from review.** `doctor` reads Codex's `config.toml` as TOML, so a `SessionStart` hook written as an inline

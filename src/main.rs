@@ -32,8 +32,9 @@ gopola — past Claude Code sessions, from the transcripts; meaning search throu
   gopola timeline --query <words>         # the best prompt/reply hit becomes the anchor
   gopola file <path> [-n 10] [--reads]    # past sessions that edited (or read) it; --hook answers PreToolUse on stdin
   gopola tools [--project P|all] [--since D] [-n 20] [--programs]   # --programs: the commands Bash calls ran, by program
-  gopola weight <session-prefix | transcript.jsonl> [-n 8]   # context per model call, and what filled it
-  gopola commands [<session-prefix>] [--grep <text>] [--project P|all] [--since D] [--until D] [--head N]   # Bash calls in full with time, status, output; subagents' too; --grep is an exact substring
+  gopola skills [<name>...] [--project P] [--since D] [--until D] [--json]   # Skill tool calls by name, all projects; /<name> turns apart
+  gopola weight <session-prefix | transcript.jsonl> [-n 8] [--agents]   # context per model call, and what filled it; --agents: each subagent's calls
+  gopola commands [<session-prefix>] [--grep <text>] [--project P|all] [--since D] [--until D] [--head N] [--no-output]   # Bash calls in full with time, status, output; subagents' too; --grep is an exact substring
   gopola dispatches <session-prefix> [--grep <text>] [--head N] [--json]   # each Agent and SendMessage call: time, description, agent id, hand-back or none, the whole prompt
   gopola hooks <session-prefix> [--grep <text>] [--head N] [--json]   # every hook run: time, hook, status, duration, command (first line, 160 chars); stderr or a block's reason always, output with --head
   gopola context <session-prefix> [--grep <text>] [--json]   # a Copilot session's system prompt, instruction updates and hook context; --grep: matches per part
@@ -79,7 +80,8 @@ fn main() {
         until: None, before: 3, after: 3, hook: false, auto: false, final_: false, no_footer: false,
         reads: false, query: false, order: "rank".into(), grep: None, words: false, meaning: false,
         git_ref: None, path: None, author: None, summary: false, no_merges: false, no_bumps: false,
-        ranges: false, no_ignore_whitespace: false, programs: false, head: None, all: false, exclude: None, install: None };
+        ranges: false, no_ignore_whitespace: false, programs: false, head: None, all: false, exclude: None, install: None,
+        no_output: false, agents: false };
     let mut positional: Vec<String> = Vec::new();
     let mut it = args.into_iter();
     fn need(it: &mut std::vec::IntoIter<String>, flag: &str) -> String {
@@ -106,6 +108,8 @@ fn main() {
             "--no-footer" => o.no_footer = true,
             "--reads" => o.reads = true,
             "--programs" => o.programs = true,
+            "--no-output" => o.no_output = true,
+            "--agents" => o.agents = true,
             "--all" => o.all = true,
             "--exclude" => o.exclude = Some(need(&mut it, "--exclude")),
             "--install" => o.install = Some(need(&mut it, "--install")),
@@ -161,6 +165,7 @@ fn main() {
         },
         "file" => { if o.n == 0 { o.n = 10 } insight::file(&o, arg.as_deref()) }
         "tools" => { if o.n == 0 { o.n = 20 } insight::tools(&o) }
+        "skills" => insight::skills(&o, positional.get(1..).unwrap_or_default()),
         "weight" => match arg { Some(p) => weight::weight(&o, &p), None => Err("weight needs a session prefix or a transcript path".into()) },
         "handback" => std::process::exit(handback::run(&o, arg.as_deref())),
         "commands" => commands::commands(&o, arg.as_deref()),
