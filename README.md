@@ -295,7 +295,8 @@ claude-mem runs on every tool call, and keeps the same `<private>` convention an
   `src/context.rs`.
 - **List hook runs.** `src/hooks.rs` reports hook runs from a Claude Code session and its subagents. Not built:
   Copilot mid-session hooks or hook runs for Codex sessions. Add hook record rules to `src/hooks.rs`.
-- **Read subagent hand-backs.** `src/handback.rs` reads the last report from the parent session transcript. Not built:
+- **Read subagent hand-backs.** `src/handback.rs` reads the last report from the parent session transcript, or with `--since` every
+  report from a time on. Not built:
   the agent's brief, full tool history, changed files, last words, stop point, or nested dispatches. Add hand-back
   record shapes to `src/handback.rs`.
 - **Keep transcript copies.** `src/archive.rs` copies quiet transcript files and reads the copies when the originals

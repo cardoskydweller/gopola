@@ -40,7 +40,7 @@ gopola — past Claude Code sessions, from the transcripts; meaning search throu
   gopola context <session-prefix> [--grep <text>] [--json]   # a Copilot session's system prompt, instruction updates and hook context; --grep: matches per part
   gopola digest [--since D] [--until D] [--project P|all] [--commits 3]   # per project per day, no model
   gopola summarize <session-prefix> [--model claude-sonnet-5]   # the one cloud model call; --auto = Stop hook, --auto --final = SessionEnd
-  gopola handback <agent-id-prefix>       # the last report a subagent returned to its session, as received (exit 1: none yet)
+  gopola handback <agent-id-prefix> [--since <time>]   # the last report a subagent returned to its session, as received (exit 1: none yet); --since: every report at or after a UTC time
   gopola authored [<repo>] [--ref R] [--since D] [--path P] [--author E] [--no-merges] [--no-bumps]   # commits on R from Claude Code sessions
   gopola blame <file|dir> [--ref R] [--summary | --ranges] [--no-ignore-whitespace] [--since D] [--author E]   # surviving lines on R (whitespace-only changes ignored), marked with the session that wrote them
   gopola doctor                           # index current? hooks and skill wired? what did gopola fail to answer?

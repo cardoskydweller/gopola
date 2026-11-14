@@ -3,6 +3,14 @@
 What changed in each version, and why. Every feature here was built after a real question went unanswered, so each
 entry names the question.
 
+## 0.20.0 — 2026-11-14
+
+**New: `handback --since <time>`.** The question: what did a fixer report across a whole fix round? `handback` prints
+the last report only, so a fixer resumed with SendMessage lost its earlier reports. In tessera session 465b838a, a
+round's re-review got the fixer's follow-up and not the fix wave's report. `--since` prints every report at or after a
+UTC time, oldest first, each under `--- hand-back <time> ---`; `--json` gives `{agent, handbacks: [...]}`. ledger
+0.25.0's `rereview-prompt` calls it.
+
 ## 0.19.1 — 2026-11-13
 
 **Fixes from 0.19.0's review.** `weight --agents`, `commands` and `hooks` read a Workflow's agents

@@ -1204,6 +1204,31 @@ fn handback_prints_a_peer_message_without_its_frame_and_the_last_one_of_a_resume
 }
 
 #[test]
+fn handback_since_prints_every_report_from_that_time_oldest_first() {
+    let w = setup();
+    let user = |ts: &str, text: &str| serde_json::json!({"type":"user","timestamp":ts,"message":{"role":"user",
+        "content":format!("Another Claude session sent a message:\n{}", peer_frame("a3since001", text))}});
+    // written out of order: the order printed is the records' time
+    handback_world(&w, &["a3since001"], &[
+        user("2026-11-14T06:32:37.100Z", "DONE\nfollow-up"),
+        user("2026-11-14T06:29:23.400Z", "DONE\nthe wave"),
+        user("2026-11-14T06:10:00.000Z", "DONE\nan earlier round"),
+    ]);
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["handback", "a3since", "--since", "2026-11-14T06:19:22Z"]);
+    assert_eq!((code, out.as_str()), (0, "--- hand-back 2026-11-14T06:29:23.400Z ---\nDONE\nthe wave\n\n--- hand-back 2026-11-14T06:32:37.100Z ---\nDONE\nfollow-up\n"), "{err}");
+    let (code, out, _) = gopola_with(&w, NO_OLLAMA, MODEL, &["handback", "a3since", "--since", "2026-11-14T07:00:00Z"]);
+    assert_eq!((code, out.as_str()), (1, ""));
+    // a hand-back within the --since second counts; --json lists each
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["handback", "a3since", "--since", "2026-11-14T06:32:37Z", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((v["agent"].as_str(), v["handbacks"][0]["ts"].as_str(), v["handbacks"][0]["text"].as_str()),
+        (Some("a3since001"), Some("2026-11-14T06:32:37.100Z"), Some("DONE\nfollow-up")));
+    assert_eq!(v["handbacks"].as_array().map(Vec::len), Some(1));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
 fn handback_reads_a_queued_command_attachment() {
     let w = setup();
     handback_world(&w, &["a2queued01"], &[serde_json::json!({"type":"attachment",
