@@ -1,5 +1,5 @@
 //! `handback <agent-id-prefix>`: the last report a subagent returned to the session that launched it,
-//! as that session received it. The subagent's own transcript does not hold the hand-back reliably
+//! as that session received it; with `--since <time>`, every report from that time on. The subagent's own transcript does not hold the hand-back reliably
 //! (its last text can be "I'll wait for the notification"), so this reads the parent transcript:
 //! `<projects>/<project>/<session>/subagents/agent-<id>.jsonl` names the parent `<project>/<session>.jsonl`.
 //!
@@ -104,19 +104,39 @@ pub fn run(o: &Opts, prefix: Option<&str>) -> i32 {
         eprintln!("gopola: no subagent file agent-{prefix}*.jsonl under {}/*/*/subagents", projects_root().display());
         return 1;
     };
-    // The latest by the record's timestamp across every parent; in one file, the later line.
-    let mut found: Option<(String, PathBuf, &'static str, String)> = None;
+    // Every hand-back in every parent, ordered by the record's timestamp; in one file, the later line last.
+    let mut all: Vec<(String, PathBuf, &'static str, String)> = Vec::new();
     for parent in &parents {
         let raw = crate::archive::read(parent).unwrap_or_default();
         for v in String::from_utf8_lossy(&raw).lines().filter(|l| l.contains(&id)).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
             let Some((shape, text)) = hand_back(&v, &id) else { continue };
             let ts = v.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
-            if found.as_ref().is_none_or(|f| ts >= f.0) { found = Some((ts, parent.clone(), shape, text)) }
+            all.push((ts, parent.clone(), shape, text));
         }
     }
-    let Some((_, parent, shape, text)) = found else {
-        let read: Vec<String> = parents.iter().map(|p| p.display().to_string()).collect();
-        eprintln!("gopola: agent {id} has no hand-back in {} (the agent may still be running)", read.join(", "));
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    let read = || parents.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+    if let Some(since) = o.since.as_deref() {
+        // a hand-back copied with its agent into a second session is one report, not two
+        all.dedup_by(|a, b| a.0 == b.0 && a.3 == b.3);
+        // UTC ISO times compare as text to the second: `06:19:22.400Z` is at or after `06:19:22Z`
+        let second = |t: &str| t.split(['.', 'Z']).next().unwrap_or(t).to_string();
+        let after: Vec<_> = all.into_iter().filter(|h| second(&h.0) >= second(since)).collect();
+        if after.is_empty() {
+            eprintln!("gopola: agent {id} has no hand-back at or after {since} in {}", read());
+            return 1;
+        }
+        if o.json {
+            let list: Vec<Value> = after.iter().map(|(ts, p, shape, text)| json!({"ts": ts, "transcript": p, "shape": shape, "text": text.trim_end()})).collect();
+            println!("{}", json!({"agent": id, "handbacks": list}));
+        } else {
+            let parts: Vec<String> = after.iter().map(|(ts, _, _, text)| format!("--- hand-back {ts} ---\n{}", text.trim_end())).collect();
+            println!("{}", parts.join("\n\n"));
+        }
+        return 0;
+    }
+    let Some((_, parent, shape, text)) = all.pop() else {
+        eprintln!("gopola: agent {id} has no hand-back in {} (the agent may still be running)", read());
         return 1;
     };
     let text = text.trim_end();

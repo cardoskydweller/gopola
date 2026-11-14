@@ -635,7 +635,7 @@ place of `text`, and the object has the total `matches`.
 
 ### `handback`
 
-    gopola handback <agent-id-prefix>
+    gopola handback <agent-id-prefix> [--since <time>]
 
 Prints the last report a subagent returned to the session that started it, without the frame and indent the
 harness adds. Useful when an agent returned its report as its final message and wrote no report file.
@@ -644,7 +644,10 @@ harness adds. Useful when an agent returned its report as its final message and 
 - Exit 1: the agent has returned nothing yet (the message names the transcript it read).
 - Exit 2: no such agent, or the prefix matches two agents (the message names them).
 
-An agent resumed with `SendMessage` has several reports; the last one is printed. A stopped agent has no report: the
+An agent resumed with `SendMessage` has several reports; the last one is printed. `--since <time>` prints every
+report at or after a UTC time (`2026-11-14T06:19:22Z`, or a prefix such as `2026-11-14`), oldest first, each after
+a line `--- hand-back <time> ---`. Exit 1 when there is none. `ledger rereview-prompt` uses it to read a fix
+round's reports. A stopped agent has no report: the
 command prints its last text with exit 0, so check before using it as a report.
 
 gopola finds the report in the parent session's transcript, not in the agent's own transcript, which does not hold
@@ -659,7 +662,7 @@ it reliably. It reads four record shapes:
 
 A notification that only says the report was delivered as a message holds no report and is skipped.
 
-`--json`: `{agent, transcript, shape, text}`.
+`--json`: `{agent, transcript, shape, text}`; with `--since`, `{agent, handbacks: [{ts, transcript, shape, text}]}`.
 
 ### `weight`
 
