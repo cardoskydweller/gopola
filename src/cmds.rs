@@ -8,6 +8,7 @@ use std::path::Path;
 
 pub type Res = Result<(), Box<dyn std::error::Error>>;
 
+#[derive(Default)]
 pub struct Opts {
     pub json: bool,
     pub project: Option<String>,
@@ -48,6 +49,13 @@ pub struct Opts {
     pub install: Option<String>,
     pub no_output: bool,
     pub agents: bool,
+    pub setup: bool,
+    pub dir: Option<String>,
+    pub session: Option<String>,
+    pub label: Option<String>,
+    pub confirm: Option<String>,
+    pub pending: bool,
+    pub import_labels: Option<String>,
 }
 
 /// A session this long is worth a summary; below it, the block speaks for itself.
@@ -309,59 +317,24 @@ fn short_ref(kind: &str, r: &str) -> String {
     }
 }
 
+/// What `search` found, before any printing: the rows with how each was found, how many matched by words alone, and
+/// the notes it prints.
+pub struct SearchRows {
+    pub rows: Vec<(Hit, &'static str)>,
+    pub word_hits: usize,
+    pub note: Option<String>,
+    pub nearest: bool,
+    pub any_term: bool,
+}
+
 pub fn search(o: &Opts, query: &str) -> Res {
     let c = crate::db::open()?;
     let project = project_filter(o);
     let since = o.since.clone().unwrap_or_default();
     let until = o.until.clone().unwrap_or_else(|| "9999".into());
-    let kind = o.kind.clone().unwrap_or_default();
-    // Meaning ranks turns, so it applies only when no --kind narrows the rows, and never with --words.
-    // rank_turns asks Ollama nothing when no turn has a vector for the model; then no note either.
-    let mut note: Option<String> = None;
-    if o.meaning && !o.words {
-        if !kind.is_empty() {
-            note = Some("# meaning not used: --kind searches words only".into());
-        } else if !crate::embed::has_vectors(&c, &crate::embed::Embedder::from_env().model).unwrap_or(true) {
-            note = Some(format!("# meaning not used: no turn has a vector for {} (run `gopola embed`)",
-                crate::embed::Embedder::from_env().model));
-        }
-    }
-    let meaning: Vec<Hit> = if o.words || !kind.is_empty() { Vec::new() } else {
-        let e = crate::embed::Embedder::from_env();
-        match crate::embed::rank_turns(&c, &e, query, &project, &since, &until, 200) {
-            Ok(m) => m,
-            Err(err) => { note = Some(format!("# meaning search off: {err}; words only")); Vec::new() }
-        }
-    };
-    let fused = !meaning.is_empty();
-    // Words only: 0.3.0's query, order and LIMIT exactly. Fused: by rank, and enough rows to fuse;
-    // `--order date` then orders the fused top n (fuse).
-    let order = if o.order == "date" && !fused { "ts desc" } else { "rank" };
-    let limit = if fused { o.n.max(50) } else { o.n };
-    let mut st = c.prepare(&format!(
-        "select kind, ref, project, ts, snippet(fts, 4, '[', ']', '…', 8)
-         from fts where fts match ?1 and (project = ?2 or ?2 = 'all')
-           and ts >= ?3 and ts < ?6 and (kind = ?4 or ?4 = '')
-         order by {order} limit ?5"))?;
-    let mut any_term = false;
-    let mut word_rows: Vec<Hit> = st.query_map(
-        params![fts_query(query, false), project, since, kind, limit as i64, until],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.flatten().collect();
-    if word_rows.is_empty() && !fused && query.split_whitespace().count() > 1 {
-        // 0.3.0's any-word fallback, only when meaning has nothing to offer: it ranks on "on" and "my" too.
-        any_term = true;
-        word_rows = st.query_map(
-            params![fts_query(query, true), project, since, kind, o.n as i64, until],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.flatten().collect();
-    }
+    let SearchRows { rows, word_hits, note, nearest, any_term } = search_rows(&c, o, query, &project, &since, &until)?;
     // `doctor` lists searches that found nothing from this count: word hits, never fused ones.
-    crate::db::log_usage(&c, "search", query, word_rows.len() as i64);
-    let nearest = fused && word_rows.is_empty() && !o.meaning;
-    let rows: Vec<(Hit, &str)> = if fused {
-        fuse(&word_rows, &meaning, o)
-    } else {
-        word_rows.into_iter().map(|h| (h, "words")).collect()
-    };
+    crate::db::log_usage(&c, "search", query, word_hits as i64);
     if o.json {
         let v: Vec<Value> = rows.iter().map(|((k, rf, p, ts, s), via)|
             json!({"kind": k, "ref": rf, "project": p, "ts": ts, "snippet": s, "via": via})).collect();
@@ -394,6 +367,58 @@ pub fn search(o: &Opts, query: &str) -> Res {
             s.split_whitespace().collect::<Vec<_>>().join(" "));
     }
     Ok(())
+}
+
+pub fn search_rows(c: &Connection, o: &Opts, query: &str, project: &str, since: &str, until: &str)
+    -> Result<SearchRows, Box<dyn std::error::Error>> {
+    let kind = o.kind.clone().unwrap_or_default();
+    // Meaning ranks turns, so it applies only when no --kind narrows the rows, and never with --words.
+    // rank_turns asks Ollama nothing when no turn has a vector for the model; then no note either.
+    let mut note: Option<String> = None;
+    if o.meaning && !o.words {
+        if !kind.is_empty() {
+            note = Some("# meaning not used: --kind searches words only".into());
+        } else if !crate::embed::has_vectors(c, &crate::embed::Embedder::from_env().model).unwrap_or(true) {
+            note = Some(format!("# meaning not used: no turn has a vector for {} (run `gopola embed`)",
+                crate::embed::Embedder::from_env().model));
+        }
+    }
+    let meaning: Vec<Hit> = if o.words || !kind.is_empty() { Vec::new() } else {
+        let e = crate::embed::Embedder::from_env();
+        match crate::embed::rank_turns(c, &e, query, project, since, until, 200) {
+            Ok(m) => m,
+            Err(err) => { note = Some(format!("# meaning search off: {err}; words only")); Vec::new() }
+        }
+    };
+    let fused = !meaning.is_empty();
+    // Words only: 0.3.0's query, order and LIMIT exactly. Fused: by rank, and enough rows to fuse;
+    // `--order date` then orders the fused top n (fuse).
+    let order = if o.order == "date" && !fused { "ts desc" } else { "rank" };
+    let limit = if fused { o.n.max(50) } else { o.n };
+    let mut st = c.prepare(&format!(
+        "select kind, ref, project, ts, snippet(fts, 4, '[', ']', '…', 8)
+         from fts where fts match ?1 and (project = ?2 or ?2 = 'all')
+           and ts >= ?3 and ts < ?6 and (kind = ?4 or ?4 = '')
+         order by {order} limit ?5"))?;
+    let mut any_term = false;
+    let mut word_rows: Vec<Hit> = st.query_map(
+        params![fts_query(query, false), project, since, kind, limit as i64, until],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.flatten().collect();
+    if word_rows.is_empty() && !fused && query.split_whitespace().count() > 1 {
+        // 0.3.0's any-word fallback, only when meaning has nothing to offer: it ranks on "on" and "my" too.
+        any_term = true;
+        word_rows = st.query_map(
+            params![fts_query(query, true), project, since, kind, o.n as i64, until],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.flatten().collect();
+    }
+    let word_hits = word_rows.len();
+    let nearest = fused && word_rows.is_empty() && !o.meaning;
+    let rows: Vec<(Hit, &'static str)> = if fused {
+        fuse(&word_rows, &meaning, o)
+    } else {
+        word_rows.into_iter().map(|h| (h, "words")).collect()
+    };
+    Ok(SearchRows { rows, word_hits, note, nearest, any_term })
 }
 
 /// The harness a session came from; an id that names no session (a commit's sha) has none.

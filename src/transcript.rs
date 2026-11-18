@@ -255,6 +255,29 @@ pub fn clip(text: &str, n: usize) -> String {
     out
 }
 
+/// `s` with every control character and bidi override written as `\u{..}`: a transcript can hold terminal escapes
+/// and text-direction overrides, and printed raw they act on the terminal or disguise what is shown.
+pub fn printable(s: &str) -> String {
+    let bidi = |c| matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    s.chars().map(|c| if c.is_control() || bidi(c) { c.escape_unicode().to_string() } else { c.to_string() }).collect()
+}
+
+/// The largest file a command reads whole: 8 MiB.
+pub const MAX_INPUT_BYTES: u64 = 8 << 20;
+
+/// A file's text, read through `take(limit + 1)` so a huge file is never held: more than `limit` bytes is refused,
+/// and nothing is parsed.
+pub fn read_capped(path: &std::path::Path, limit: u64) -> Result<String, String> {
+    use std::io::Read;
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).map_err(io)?.take(limit + 1).read_to_end(&mut bytes).map_err(io)?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("{} is over {limit} bytes", path.display()));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +401,26 @@ mod tests {
     fn clip_respects_char_boundaries() {
         assert_eq!(clip("héllo wörld", 5), "héllo…");
         assert_eq!(clip("hi", 5), "hi");
+    }
+
+    #[test]
+    fn printable_escapes_controls_and_bidi() {
+        assert_eq!(printable("a\u{1b}[2Jb\u{202e}c\u{9b}d\te\u{61c}f"), "a\\u{1b}[2Jb\\u{202e}c\\u{9b}d\\u{9}e\\u{61c}f");
+        assert_eq!(printable("naïve 🦀"), "naïve 🦀");
+    }
+
+    #[test]
+    fn read_capped_refuses_a_file_over_the_limit() {
+        let dir = std::env::temp_dir().join(format!("gopola-read-capped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = dir.join("text");
+        std::fs::write(&text, "0123456789a").unwrap();
+        assert!(read_capped(&text, 10).unwrap_err().contains("is over 10 bytes"));
+        assert_eq!(read_capped(&text, 11).unwrap(), "0123456789a");
+        let bad = dir.join("bad");
+        std::fs::write(&bad, [0xff, 0xfe]).unwrap();
+        assert!(read_capped(&bad, 10).unwrap_err().contains("is not UTF-8"));
+        assert!(read_capped(&dir.join("missing"), 10).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

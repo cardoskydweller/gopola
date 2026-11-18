@@ -3,6 +3,81 @@
 What changed in each version, and why. Every feature here was built after a real question went unanswered, so each
 entry names the question.
 
+## 0.21.0 — 2026-11-18
+
+**New: `ask`.** The question: what did we decide about X, answered in one command and without a chat model? `search`
+lists hits and leaves the reading to whoever asked. `ask <question>` searches all projects (unless `--project` is
+given), has a local reranker (Qwen3-Reranker-0.6B, in the process through llama.cpp and Metal) read the 8 best hits,
+and prints the turn that answers it and its key sentence, or `not found`; `--json` gives `found`, `ref`, `session`,
+`turn`, `sentence` and `score`. macOS only. `ask --setup` downloads the model once (639 MB, from a pinned Hugging Face
+commit with the system curl, checked by size and sha256 before it is placed beside the database). `ask` holds about
+1.3 GB at peak (1,344 MB measured) while it runs and frees it on exit. On macOS the build now also needs CMake (the Xcode
+Command Line Tools were already needed), because it compiles llama.cpp; Linux needs neither.
+
+**New: `eval ask --dir <folder>`.** The question: how often is `ask` right, and what does a wrong answer cost? It scores
+every phrasing of every question in an eval folder: right first turn, wrong first cites, good outcomes (the gold turn,
+or `not found` when nothing answers), invented refs and the key sentence, with time and peak memory, each phrasing
+judged at a threshold fitted on every other question. It prints refs and numbers, never a turn's words.
+
+**Measured** on 34 questions in 68 phrasings, leave-one-question-out: the right first turn on 20 of 60 answer
+phrasings; 2 wrong first cites; 1 of 8 phrasings with no answer was given a citation; 44 of 68 good outcomes; 0
+invented references; the key sentence right on 18 of 31. Search plus reranking took a median 1.83 s, 90th percentile
+3.34 s, slowest 10.98 s; peak memory 1,344 MB; the model loads in 0.58 s.
+
+**Kept: a top hit that is not a turn gives `not found`.** The other rule, answering with the best-scoring turn among the
+hits, scored 39 good outcomes minus wrong citations; `not found` scored 42. The threshold is 0.99659204, and the key
+sentence is the best of all sentences, which scored the same 18 of 31 as the length filter and above the quote filter.
+
+**Changed: the embedder asks Ollama to keep its model loaded for 30 minutes** after each request, so a search within 30
+minutes of the last one finds it loaded. gopola's own HTTP calls still go only to `GOPOLA_OLLAMA`; the only other
+download is `ask --setup`'s. The macOS binary now includes llama.cpp and ggml (MIT); the README carries their licence.
+
+**New: `friction`.** The question: which of my prompts were me correcting a session, without reading every transcript?
+`friction --since <date>` (or `--session <prefix>`) scores each prompt you typed in two ways and lists the likeliest
+corrections first. d3 (`d3:4b-nvfp4`) is asked through the local Ollama's `/v1/systemone` whether the prompt corrects the
+assistant. A classifier, trained on the labels you have confirmed over the prompt's embedding, is the second score; the
+list ranks by the mean of the two ranks and shows both. The classifier stays off until the confirmed labels hold a
+correction and a prompt that was not one. `--import-labels`, `--label`, `--confirm` and `--pending` keep those labels in
+the new `labels` table (schema 10, with `scores` for d3's scores), and a label recorded with `--label` never replaces a
+confirmed one. Scoring reads the Mac's memory pressure before each prompt and stops at level 4 (critical) only, because
+level 2 is normal on a Mac in daily use; d3 is about 4 GB loaded and up to about 6.4 GB at peak, and a run stopped after a d3 call asks Ollama to free it, records
+itself as deferred and is picked up again by the next run. macOS only: elsewhere a run records `friction-skipped`.
+
+**New: `friction --auto`, a SessionEnd hook.** It starts the ended session's scoring as a separate background process and
+returns at once, so a slow or deferred run never holds up the end of a session; the detached run also scores up to five
+earlier sessions that were deferred or failed in the last 7 days. `doctor` now expects the hook (SessionEnd has three of
+gopola's hooks) and has a friction line: the deferred and failed runs of the last 30 days, and the ended sessions whose
+prompts are still unscored, with the `friction --since` command that scores them and its cost.
+
+**New: `eval friction --dir <folder>`.** The question: how well does friction find the corrections, and is that enough
+to read only the top of its list? It scores d3, the classifier (each session's prompts by a model trained on all the
+others) and their mean rank on a labelled folder: average precision over all prompts and over the committed prompts
+alone, the corrections found in the top 20 per 100 prompts, and the flags at a score of 0.5 with their precision and
+recall. The done line is an average precision of 0.6 for the mean rank of the two (FR-3, the name the report prints).
+It prints ids and numbers, never a prompt's words, and opens no database.
+
+**Measured** on 224 prompts from 19 sessions with 30 corrections (borderline counted as not a correction), each
+session's prompts scored by a classifier trained on the other sessions: average precision 0.675 for the mean rank of the
+two (0.715 on the 133 committed prompts), against 0.535 for d3 alone and 0.645 for the classifier alone; the top 45
+prompts held 23 of the 30 corrections. The run took 115 s with d3 loaded (4.0 GB in Ollama). The Mac's memory pressure
+stayed at normal or warn (level 1 to 2, never critical) during the run and during a real session's end, whose prompt the
+detached run scored before Claude Code had exited.
+
+**Fixed: three faults from the security and final reviews.** The question: can the text of a session change what `ask`
+cites, and can a command download unasked? A turn that held a chat-control marker such as `<|im_end|>` reached the
+reranker as a real marker; the question and the turn's text are now read as plain text, and plain text scores exactly
+as before. `rusqlite` is 0.41, which bundles SQLite 3.54: the 3.53 before it could return uninitialized memory from a
+database opened together with a crafted `-wal` file (RUSTSEC-2026-0459). `gopola ask what does --setup do` started the
+639 MB download; `--setup` with question words now exits 2 and names both forms.
+
+**Fixed: five faults in `friction`.** A run killed after a hand-typed prefix (`--session abcd1234`) left a
+`did not finish` row that the catch-up retried at every session end for 7 days; the catch-up now reads each row's
+scope as the one session it names, leaves a prefix that names none or several alone, and records a `friction-failed`
+row when it cannot read the rows. `--import-labels` refuses a file that gives one turn two different labels under two
+keys (a prefix and the full id), naming both. The eval's done line shows the
+average precision that it judges, to four decimals (the table rounds to three, so 0.5996 read 0.600 above a fail), and
+a label entry that is not an object names its id. `doctor` counts the sessions skipped, not time windows.
+
 ## 0.20.0 — 2026-11-14
 
 **New: `handback --since <time>`.** The question: what did a fixer report across a whole fix round? `handback` prints

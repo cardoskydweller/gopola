@@ -1,4 +1,4 @@
-//! A stand-in for Ollama's `POST /api/embed`, for tests: a second implementation of the contract in
+//! A stand-in for Ollama's `POST /api/embed`, `POST /v1/systemone` and unload, for tests: a second implementation of the contract in
 //! tests/fixtures/ollama/README.md. It answers from the captured fixtures there, with deterministic topic
 //! vectors in place of real ones, and can be as rude as the real server (`Rude`).
 
@@ -14,6 +14,7 @@ const TOPICS: &[&[&str]] = &[
     &["ollama", "laptop", "local model"],
     &["protobuf", "binary format"],
     &["safari", "apple's browser"],
+    &["wrong", "told you"],
 ];
 
 /// How the fake misbehaves. The real server loads a model cold in about 2 s, can fail with a
@@ -29,14 +30,46 @@ pub enum Rude {
     WrongRowCount,
     /// Read the request, then close the connection without answering.
     HangUp,
+    /// `/v1/systemone` answers the not-pulled 404 whatever the model (d3 was removed). Embed is unchanged.
+    NoDecisionModel,
+    /// `/v1/systemone` answers a `noul` of 1.5, outside [0, 1]. Embed is unchanged.
+    NoulOutOfRange,
+    /// `/v1/systemone` answers 400 `{"error": "rejected"}` for a state that contains this text (compared in
+    /// lower case), and the normal answer for any other. Embed is unchanged.
+    RejectState(&'static str),
+    /// An unload (`/api/generate` with `keep_alive` 0) is counted, then answered 500. Everything else is polite.
+    UnloadFails,
+    /// `POST <route>` is answered with this status line (`302 Found`) and a `Location`, and is not counted;
+    /// every other request is polite.
+    Redirect { route: &'static str, status: &'static str, location: &'static str },
 }
+
+/// The decision model that `/v1/systemone` answers; any other model is not pulled.
+pub const DECISION_MODEL: &str = "d3:4b-nvfp4";
 
 pub struct FakeOllama {
     pub url: String,
-    /// Requests to `POST /api/embed` (any other request is answered 404 and not counted).
+    /// Requests to `POST /api/embed` (the other routes are counted in `systemone` and `unloads`; a request to any
+    /// route that the fake does not know is answered 404 and not counted).
     pub requests: Arc<AtomicUsize>,
     /// Inputs per `POST /api/embed` request, in the order they came: the batches gopola sent.
     pub batches: Arc<Mutex<Vec<usize>>>,
+    /// Every `POST /api/embed` body as parsed, in the order they came.
+    pub bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// Every `POST /v1/systemone` body as parsed, in the order they came.
+    pub systemone: Arc<Mutex<Vec<serde_json::Value>>>,
+    /// `POST /api/generate` requests with `keep_alive` 0: the unloads.
+    pub unloads: Arc<AtomicUsize>,
+}
+
+/// What every connection's thread records into, shared with the `FakeOllama` that a test holds.
+#[derive(Clone, Default)]
+struct Seen {
+    requests: Arc<AtomicUsize>,
+    batches: Arc<Mutex<Vec<usize>>>,
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    systemone: Arc<Mutex<Vec<serde_json::Value>>>,
+    unloads: Arc<AtomicUsize>,
 }
 
 /// A fixture from tests/fixtures/ollama, by file stem.
@@ -53,21 +86,20 @@ impl FakeOllama {
     pub fn start_rude(dim: usize, known_model: &str, rude: Rude) -> FakeOllama {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let requests = Arc::new(AtomicUsize::new(0));
-        let batches = Arc::new(Mutex::new(Vec::new()));
-        let (count, sizes, known) = (requests.clone(), batches.clone(), known_model.to_string());
+        let seen = Seen::default();
+        let (shared, known) = (seen.clone(), known_model.to_string());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (count, sizes, known) = (count.clone(), sizes.clone(), known.clone());
-                std::thread::spawn(move || serve(stream, dim, &known, rude, &count, &sizes));
+                let (shared, known) = (shared.clone(), known.clone());
+                std::thread::spawn(move || serve(stream, dim, &known, rude, &shared));
             }
         });
-        FakeOllama { url, requests, batches }
+        FakeOllama { url, requests: seen.requests, batches: seen.batches, bodies: seen.bodies, systemone: seen.systemone, unloads: seen.unloads }
     }
 }
 
 /// One connection: requests one after another until the client closes it (keep-alive, as the real server).
-fn serve(stream: TcpStream, dim: usize, known: &str, rude: Rude, count: &AtomicUsize, sizes: &Mutex<Vec<usize>>) {
+fn serve(stream: TcpStream, dim: usize, known: &str, rude: Rude, seen: &Seen) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut out = stream;
     loop {
@@ -94,18 +126,47 @@ fn serve(stream: TcpStream, dim: usize, known: &str, rude: Rude, count: &AtomicU
         if reader.read_exact(&mut body).is_err() {
             return;
         }
-        if !request_line.starts_with("POST /api/embed ") {
+        let is = |path: &str| request_line.starts_with(&format!("POST {path} "));
+        if let Rude::Redirect { route, status, location } = rude
+            && is(route)
+        {
+            let _ = out.write_all(format!("HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n").as_bytes());
+            continue;
+        }
+        let (systemone, generate) = (is("/v1/systemone"), is("/api/generate"));
+        if !(is("/api/embed") || systemone || generate) {
             send(&mut out, "404 Not Found", "text/plain; charset=utf-8", b"404 page not found", false);
             continue;
         }
         let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if generate {
+            // Only an unload (keep_alive 0) is captured; any other generate is not a route this fake knows.
+            if req["keep_alive"] == 0 {
+                seen.unloads.fetch_add(1, Ordering::SeqCst);
+                if matches!(rude, Rude::UnloadFails) {
+                    send(&mut out, "500 Internal Server Error", "application/json; charset=utf-8", br#"{"error":"boom"}"#, false);
+                    continue;
+                }
+                let mut answer = fixture("unload-d3")["response"].clone();
+                answer["model"] = req["model"].clone();
+                send(&mut out, "200 OK", "application/json; charset=utf-8", answer.to_string().as_bytes(), false);
+            } else {
+                send(&mut out, "404 Not Found", "text/plain; charset=utf-8", b"404 page not found", false);
+            }
+            continue;
+        }
         let inputs: Vec<String> = match &req["input"] {
             serde_json::Value::String(s) => vec![s.clone()],
             serde_json::Value::Array(a) => a.iter().map(|t| t.as_str().unwrap_or("").to_string()).collect(),
             _ => Vec::new(),
         };
-        count.fetch_add(1, Ordering::SeqCst);
-        sizes.lock().unwrap().push(inputs.len());
+        if systemone {
+            seen.systemone.lock().unwrap().push(req.clone());
+        } else {
+            seen.requests.fetch_add(1, Ordering::SeqCst);
+            seen.batches.lock().unwrap().push(inputs.len());
+            seen.bodies.lock().unwrap().push(req.clone());
+        }
         match rude {
             Rude::HangUp => return,
             Rude::DelayMs(ms) => std::thread::sleep(std::time::Duration::from_millis(ms)),
@@ -113,7 +174,11 @@ fn serve(stream: TcpStream, dim: usize, known: &str, rude: Rude, count: &AtomicU
                 send(&mut out, "500 Internal Server Error", "text/plain; charset=utf-8", b"Internal Server Error", false);
                 continue;
             }
-            Rude::Polite | Rude::WrongRowCount => {}
+            Rude::Polite | Rude::WrongRowCount | Rude::NoDecisionModel | Rude::NoulOutOfRange | Rude::RejectState(_) | Rude::UnloadFails | Rude::Redirect { .. } => {}
+        }
+        if systemone {
+            answer_systemone(&mut out, &req, rude);
+            continue;
         }
         let model = req["model"].as_str().unwrap_or("").to_string();
         if model != known {
@@ -139,6 +204,38 @@ fn serve(stream: TcpStream, dim: usize, known: &str, rude: Rude, count: &AtomicU
         answer["embeddings"] = serde_json::json!(rows);
         send(&mut out, "200 OK", "application/json; charset=utf-8", answer.to_string().as_bytes(), chunked);
     }
+}
+
+/// `POST /v1/systemone`, after the rude modes shared with embed: see "How the fake answers" in the README.
+fn answer_systemone(out: &mut TcpStream, req: &serde_json::Value, rude: Rude) {
+    let json = "application/json; charset=utf-8";
+    let model = req["model"].as_str().unwrap_or("");
+    if model != DECISION_MODEL || matches!(rude, Rude::NoDecisionModel) {
+        let f = fixture("systemone-model-missing");
+        let error = f["response"]["error"].as_str().unwrap().replace(f["request"]["model"].as_str().unwrap(), model);
+        send(out, "404 Not Found", json, serde_json::json!({"error": error}).to_string().as_bytes(), false);
+        return;
+    }
+    if !(1..=64).contains(&req["questions"].as_object().map_or(0, |q| q.len())) {
+        send(out, "400 Bad Request", json, fixture("systemone-no-questions")["response"].to_string().as_bytes(), false);
+        return;
+    }
+    let state = req["state"].as_str().unwrap_or("").to_lowercase();
+    if matches!(rude, Rude::RejectState(t) if state.contains(&t.to_lowercase())) {
+        send(out, "400 Bad Request", json, br#"{"error":"rejected"}"#, false);
+        return;
+    }
+    let noul = if matches!(rude, Rude::NoulOutOfRange) {
+        1.5
+    } else if state.contains("wrong") || state.contains("told you") {
+        0.9
+    } else {
+        0.1
+    };
+    let mut answer = fixture("systemone-noul")["response"].clone();
+    answer["model"] = serde_json::json!(model);
+    answer["answers"]["friction"]["noul"] = serde_json::json!(noul);
+    send(out, "200 OK", json, answer.to_string().as_bytes(), false);
 }
 
 /// Write one answer. Its length is computed here: a wrong `Content-Length` makes ureq fail with

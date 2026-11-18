@@ -1,9 +1,9 @@
 {
   "about": "a model that is not pulled: 404 naming it",
-  "source": "ollama 0.40.3 at localhost:11434, 2026-10-13, the pre-flight scan's probe (status, content type and body as it recorded them; it did not record the input)",
-  "request": {"model": "nomodel:1b", "input": ["hello world"], "truncate": true},
+  "source": "ollama 0.40.16 at localhost:11434, 2026-11-17, a curl without keep_alive (status and body)",
+  "request": {"model": "nomodel:1b", "input": ["hello world"], "truncate": true, "keep_alive": "30m"},
   "status": 404,
   "keys_include": ["error"],
-  "error_contains": "model \"nomodel:1b\" not found, try pulling it first",
-  "response": {"error": "model \"nomodel:1b\" not found, try pulling it first"}
+  "error_contains": "model 'nomodel:1b' not found",
+  "response": {"error": "model 'nomodel:1b' not found"}
 }
