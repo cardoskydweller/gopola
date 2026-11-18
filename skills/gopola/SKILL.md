@@ -9,7 +9,12 @@ This skill gives you past sessions, from the transcripts, as commands. Every com
 basename of the git toplevel. `--project all` makes the search wider.
 
     gopola search <words> [--kind prompt|reply|command|commit|summary|title|observation] [--since D] [-n 10] [--words | --meaning]
+    gopola ask <question> [--project P] [--since D]  # macOS: the one turn that answers it and its key sentence, or "not found"; all projects by default
+    gopola ask --setup                               # once: download the local reranker (639 MB) that ask needs
     gopola embed                                     # give new turns their vectors (a SessionEnd hook does this)
+    gopola friction --since D [--project P|all] [-n 10]  # macOS: score typed prompts with a local model, then list the likeliest corrections (a SessionEnd hook scores each ended session)
+    gopola friction --session <prefix>               # the same for one session
+    gopola friction --label <ref> <label>            # a verdict (correction, borderline, not_friction) that waits for the user's yes: --pending lists them, --confirm <ref> [<label>] is the yes; --import-labels <file> loads confirmed ones
     gopola show <session-prefix> [--turn N]          # the turns; --turn N is the full prompt and reply
     gopola show <session-prefix> --grep <word>       # only the turns that mention it, with the commands that did
     gopola timeline <session[:turn] | sha>           # what happened around a hit
@@ -50,6 +55,21 @@ exports the transcript to a `transcript/<job>` branch (gopola's README, "Cloud s
    `show <id> --grep X`. The words of a session often never name the tool that it ran. Never use `jq` over transcripts
    for this: these two commands replaced it (2026-10-13). Use `--project all` when the session can be in another repo.
 3. Quote what you found with its session id and turn, so the user can open it.
+
+**Use `ask` in place of `search` when a question in your own words wants one turn** ("what did we decide about the
+keep-alive?"). It prints the turn and its key sentence, or `not found`. It sends the question to the local Ollama for the meaning half of the search, and nothing leaves the
+Mac. A `not found` means
+that no turn scored high enough, so it is not proof that nothing was said: try `search` with other words. Use `search`
+when you want every hit, a date order, a kind, or an exact term. If `ask` says to run `ask --setup`, run it once; it
+downloads 639 MB.
+
+**Use `friction` for "which of my prompts were me correcting a session"**, instead of reading transcripts. It scores
+each prompt you typed with d3 through the local Ollama, and with a classifier once confirmed labels exist (at least one of each class: a correction and a prompt that was not
+one); nothing
+leaves the Mac. `--since` covers the current project only: add `--project all` for every project. A first run over many
+sessions is slow (about 0.43 s a prompt with d3 held in memory): start with `--since` seven days back. A run that
+says `deferred` stopped because the Mac's memory pressure was critical; run it again later. A label you record with
+`--label` waits for the user's `--confirm`, and never replaces a confirmed one.
 
 **For "which code on this branch did Claude sessions write"**, use `authored` and `blame`. Never build it from
 `digest`, `sed` and `git log`: on 2026-10-14 that pipeline matched 0 commits on its first attempt. The tool keeps only

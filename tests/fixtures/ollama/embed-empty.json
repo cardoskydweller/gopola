@@ -1,7 +1,7 @@
 {
   "about": "an empty list: 200 with no rows, and only two keys",
   "source": "ollama 0.40.3 at localhost:11434, 2026-10-13",
-  "request": {"model": "embeddinggemma-2:270m", "input": [], "truncate": true},
+  "request": {"model": "embeddinggemma-2:270m", "input": [], "truncate": true, "keep_alive": "30m"},
   "status": 200,
   "keys_include": ["model", "embeddings"],
   "rows": 0,
