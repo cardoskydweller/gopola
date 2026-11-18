@@ -1,6 +1,8 @@
-//! gopola — what happened in past Claude Code sessions, from the transcripts; local embeddings for meaning search, one cloud model call (summarize).
+//! gopola — what happened in past Claude Code sessions, from the transcripts; local embeddings for meaning search, a local reranker for `ask` and a local model for `friction` (macOS), one cloud model call (summarize).
 
 mod archive;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod ask;
 mod authored;
 mod cmds;
 mod codex;
@@ -10,23 +12,34 @@ mod copilot;
 mod db;
 mod dispatches;
 mod embed;
+mod eval;
+mod friction;
 mod handback;
 mod hooks;
 mod index;
 mod insight;
+#[cfg(target_os = "macos")]
+mod rerank;
 mod transcript;
 mod weight;
 
 use cmds::Opts;
 
 const USAGE: &str = "\
-gopola — past Claude Code sessions, from the transcripts; meaning search through local Ollama
+gopola — past Claude Code sessions, from the transcripts; meaning search through local Ollama, `ask` through a local reranker and `friction` through a local model (macOS)
 
   gopola index [--full] [--quiet]
   gopola archive                          # copy transcripts quiet for an hour into gopola's archive (index does it too)
   gopola recent [--project P|all] [-n 6] [--commits 2] [--lines 30] [--all] [--exclude <session-id>]   # scripted Copilot runs are one folded line; --all lists them; --exclude leaves one session out
   gopola search <query> [--project P|all] [--since D] [--until D] [--kind prompt|reply|command|commit|summary|title|observation] [--order rank|date] [-n 10] [--words | --meaning]
+  gopola ask <question> [--project P] [--since D] [--until D]   # the turn that answers it and its key sentence, or \"not found\"; a local reranker, macOS
+  gopola ask --setup                      # download the reranker (639 MB, once)
+  gopola eval ask --dir <eval folder>     # score ask on an eval set: right first turn, wrong cites, good outcomes, sentence score, time, memory (macOS)
+  gopola eval friction --dir <eval folder>   # score friction mining on an eval set (d3, the classifier left one session out, FR-3): AP, top-k, flags; opens no database (macOS)
   gopola embed [--limit N] [--quiet]      # vectors for meaning search, through local Ollama (GOPOLA_OLLAMA, GOPOLA_EMBED_MODEL)
+  gopola friction --session <prefix> | --since D [--project P|all] [-n 10] [--quiet]   # score typed prompts with d3 + the classifier, then list the likeliest corrections; --quiet prints nothing
+  gopola friction --import-labels <file> | --label <ref> <label> | --pending | --confirm <ref> [<label>]   # labels the classifier trains on
+  gopola friction --auto                  # SessionEnd hook: starts the ended session's scoring in the background, reads the session id from stdin
   gopola show <session-prefix> [--turn N] [--grep <word>]   # --grep: only turns whose prompt, reply or commands mention it
   gopola timeline <session[:turn] | commit-sha> [--before 3] [--after 3]
   gopola timeline --query <words>         # the best prompt/reply hit becomes the anchor
@@ -81,7 +94,8 @@ fn main() {
         reads: false, query: false, order: "rank".into(), grep: None, words: false, meaning: false,
         git_ref: None, path: None, author: None, summary: false, no_merges: false, no_bumps: false,
         ranges: false, no_ignore_whitespace: false, programs: false, head: None, all: false, exclude: None, install: None,
-        no_output: false, agents: false };
+        no_output: false, agents: false, setup: false, dir: None, session: None, label: None, confirm: None,
+        pending: false, import_labels: None };
     let mut positional: Vec<String> = Vec::new();
     let mut it = args.into_iter();
     fn need(it: &mut std::vec::IntoIter<String>, flag: &str) -> String {
@@ -110,6 +124,13 @@ fn main() {
             "--programs" => o.programs = true,
             "--no-output" => o.no_output = true,
             "--agents" => o.agents = true,
+            "--setup" => o.setup = true,
+            "--dir" => o.dir = Some(need(&mut it, "--dir")),
+            "--session" => o.session = Some(need(&mut it, "--session")),
+            "--label" => o.label = Some(need(&mut it, "--label")),
+            "--confirm" => o.confirm = Some(need(&mut it, "--confirm")),
+            "--pending" => o.pending = true,
+            "--import-labels" => o.import_labels = Some(need(&mut it, "--import-labels")),
             "--all" => o.all = true,
             "--exclude" => o.exclude = Some(need(&mut it, "--exclude")),
             "--install" => o.install = Some(need(&mut it, "--install")),
@@ -145,6 +166,26 @@ fn main() {
         "copilot-hook" => cmds::copilot_hook(&o),
         "codex-hook" => match &o.install { Some(bin) => cmds::codex_install(bin), None => cmds::codex_hook(&o) },
         "embed" => embed::embed_cmd(&o),
+        "eval" => eval::eval(&o, arg.as_deref()),
+        "friction" => friction::friction(&o, arg.as_deref()),
+        #[cfg(target_os = "macos")]
+        "ask" if o.setup && positional.len() == 1 => ask::setup(&o),
+        // `gopola ask what does --setup do` is a question, and nothing downloads unasked.
+        #[cfg(target_os = "macos")]
+        "ask" if o.setup => {
+            eprintln!("gopola: ask takes a question or --setup, not both: `gopola ask <question>` or `gopola ask --setup`");
+            std::process::exit(2)
+        }
+        #[cfg(target_os = "macos")]
+        "ask" => match positional.get(1..) {
+            Some(q) if !q.is_empty() => ask::ask(&o, &q.join(" ")),
+            _ => Err("ask needs a question (or --setup)".into()),
+        },
+        #[cfg(not(target_os = "macos"))]
+        "ask" => {
+            eprintln!("gopola ask needs macOS (the reranker runs through Metal)");
+            std::process::exit(1)
+        }
         "recent" => { if o.n == 0 { o.n = 6 } cmds::recent(&o) }
         "search" => {
             if o.n == 0 { o.n = 10 }
@@ -187,6 +228,6 @@ fn main() {
     if let Err(e) = result {
         eprintln!("gopola: {e}");
         // Hooks must never block a session: index, and the --hook/--auto forms, always exit 0.
-        std::process::exit(if cmd == "index" || (cmd == "embed" && o.quiet) || o.hook || o.auto { 0 } else { 1 });
+        std::process::exit(if cmd == "index" || ((cmd == "embed" || cmd == "friction") && o.quiet) || o.hook || o.auto { 0 } else { 1 });
     }
 }

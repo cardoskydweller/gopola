@@ -1,5 +1,5 @@
 # gopola
-<!-- tool: scope=any | when=before re-deriving anything about a past Claude Code session — "did we already do this?", "which session ran X?", "why was that session slow?", "what did that agent report?", "which hooks blocked?" — search by words or meaning instead of re-reading transcripts | run=gopola search <words> [--project all] [--words|--meaning]; gopola show <session>; gopola commands <session> --grep <text>; gopola weight <session>; gopola dispatches|hooks <session>; gopola handback <agent>; gopola doctor; gopola recent [--project P|all] [-n 6]; gopola blame <file|dir> [--summary] -->
+<!-- tool: scope=any | when=before re-deriving anything about a past Claude Code session — "did we already do this?", "which session ran X?", "why was that session slow?", "what did that agent report?", "which hooks blocked?" — search by words or meaning instead of re-reading transcripts; also before recommending a model, library or option for one of the owner's tools, because a past probe may have measured and parked it | run=gopola search <words> [--project all] [--words|--meaning]; gopola show <session>; gopola commands <session> --grep <text>; gopola weight <session>; gopola dispatches|hooks <session>; gopola handback <agent>; gopola doctor; gopola recent [--project P|all] [-n 6]; gopola blame <file|dir> [--summary] -->
 
 **Search your past Claude Code sessions: what you asked, what was done, what ran, and which code came out of them.**
 
@@ -29,7 +29,8 @@ Two rules hold throughout:
 - **The facts come from what is already on disk:** the transcripts, and git. The index is a searchable cache of
   them, and gopola stores no second copy of tool output.
 - **No model unless the work needs one.** Search, timelines, digests and attribution are deterministic. The only
-  model calls are optional: summaries of long sessions, and local embeddings for meaning search.
+  model calls are optional: summaries of long sessions, local embeddings for meaning search, and, on macOS, a local
+  reranker for `ask` and a local model that scores which of your prompts were corrections (`friction`).
 
 It is fast enough to run on every prompt. On 1,090 transcripts (870 MB), a full index took 7.5 s and made a 19 MB
 database; an unchanged re-run takes 10–50 ms.
@@ -39,6 +40,8 @@ database; an unchanged re-run takes 10–50 ms.
 | Question | Command |
 |---|---|
 | Did we already do this? Which session was it? | `gopola search <words> [--project all]` |
+| What did we decide about X, in one command and without a chat model? | `gopola ask <question>` (macOS) |
+| Which of my prompts were me correcting a session, without reading every transcript? | `gopola friction --since <date> --project all` (macOS) |
 | What happened in that session? | `gopola show <session> [--turn N] [--grep <word>]` |
 | What happened around that hit or commit? | `gopola timeline <session:turn \| sha \| --query <words>>` |
 | Which past sessions touched this file? | `gopola file <path>` |
@@ -60,7 +63,9 @@ Every command takes `--json`. Session ids can be given by prefix.
 
 ## Install
 
-You need Rust 1.85 or later. gopola runs on macOS and Linux.
+You need Rust 1.85 or later. gopola runs on macOS and Linux. On macOS the build also needs CMake (`brew install
+cmake`) and the Xcode Command Line Tools (`xcode-select --install`), because it compiles llama.cpp for `ask`; Linux
+needs neither.
 
     git clone https://github.com/cardoskydweller/gopola
     cd gopola
@@ -99,7 +104,8 @@ Add these hooks to `~/.claude/settings.json`. `gopola doctor` tells you which on
     {"type": "command", "command": "$HOME/.local/bin/gopola summarize --auto", "timeout": 120, "async": true}]}],
   "SessionEnd": [{"hooks": [
     {"type": "command", "command": "$HOME/.local/bin/gopola summarize --auto --final", "timeout": 120},
-    {"type": "command", "command": "$HOME/.local/bin/gopola embed --quiet", "timeout": 120}]}]
+    {"type": "command", "command": "$HOME/.local/bin/gopola embed --quiet", "timeout": 120},
+    {"type": "command", "command": "$HOME/.local/bin/gopola friction --auto", "timeout": 10}]}]
 }
 ```
 
@@ -113,6 +119,10 @@ What each one does:
   the edit when it happens, not at this session's next prompt. It runs on edits only, makes no model call and keeps
   no copy of the tool's output.
 - **Stop and SessionEnd** summarise long sessions (see "Model calls") and add meaning-search vectors.
+- **SessionEnd, `friction --auto`,** starts the ended session's friction scoring as a separate background process and
+  returns at once, so a slow or deferred run never holds up the end of a session. It prints nothing (a database that
+  cannot be opened is said on stderr, and it still exits 0); what a run did is a row that `gopola doctor` reads (see
+  "Model calls").
 
 Every hook form exits 0, so a broken index never stops a session. Errors go to stderr. You can use only the hooks
 you want; the first two are the core.
@@ -186,9 +196,10 @@ became 1.1 GB) and reads the copy once the original is gone ([reference](docs/re
 
 ## Privacy
 
-Nothing leaves your machine except session summaries (see "Model calls"). With the Stop and SessionEnd hooks
-installed, a summary is sent on its own once a session reaches 20 turns. To keep everything local, leave out the
-two `summarize --auto` hooks; `embed` talks only to a local Ollama.
+Nothing leaves your machine except session summaries (see "Model calls") and the one-time reranker download. With
+the Stop and SessionEnd hooks installed, a summary is sent on its own once a session reaches 20 turns. To keep
+everything local, leave out the two `summarize --auto` hooks; `embed` and `friction` talk only to a local Ollama. `ask`
+sends nothing; `ask --setup` makes one request to Hugging Face, to download the model.
 
 - Text inside `<private>…</private>` in a prompt or reply is stored as `[private]`, so it is never searchable and
   never sent to a model.
@@ -198,7 +209,7 @@ two `summarize --auto` hooks; `embed` talks only to a local Ollama.
 
 ## Model calls
 
-gopola works with no model at all. Two optional features use one:
+gopola works with no model at all. Four optional features use one:
 
 - **Summaries (cloud).** `gopola summarize <session>` sends a digest gopola already holds (prompts, closing lines,
   files, commit subjects; capped near 3k tokens) through `claude -p` and stores three lines: `asked:`, `done:`,
@@ -207,6 +218,27 @@ gopola works with no model at all. Two optional features use one:
 - **Meaning search (local).** `gopola embed` sends each turn to a local [Ollama](https://ollama.com) (`ollama pull
   embeddinggemma-2:270m` first) and stores the vector in the same database. Unchanged turns are never embedded twice. `search` then ranks by words and meaning
   together; `--words` or `--meaning` picks one. With Ollama down, search says so in one line and uses words.
+- **Answers (local, macOS).** `gopola ask <question>` runs the same search over all projects, has a small reranker
+  (Qwen3-Reranker-0.6B, run in the process through llama.cpp and Metal) read the eight best hits, and prints the one
+  turn that answers the question and its key sentence, as `<session>:<turn>  <sentence>`, or `not found`. It never
+  makes up a reference: a turn it prints is one that the search returned. `gopola ask --setup` downloads the model
+  once (639 MB, checked by size and sha256, beside the database). While `ask` runs it holds about 1.3 GB at peak (1,344 MB
+  measured), freed when it exits. The first run after the download compiles Metal shaders, about 6 s once. Words and meaning
+  search still need the index and, for meaning, Ollama (see above); with Ollama down, `ask` says so and searches
+  by words.
+- **Friction (local, macOS).** `gopola friction` finds the prompts of yours that were corrections of a session,
+  without a read of every transcript. It scores each prompt you typed (not the reply; prompts under 2,000 characters,
+  never those of scripted sessions) in two ways and ranks by both. The first is d3 (`ollama pull d3:4b-nvfp4`), asked
+  through Ollama's `/v1/systemone` whether the prompt corrects the assistant. d3 is about 4 GB loaded and up to about 6.4 GB at peak: a run's
+  prompts share one load, and Ollama frees it 30 seconds after the last. The second is a classifier trained on the
+  labels you have confirmed (`friction --label`, `--confirm`, `--import-labels`) over the prompt's embedding; it stays
+  off until you have confirmed a correction and a prompt that was not one. Before a run and before each prompt
+  gopola reads the Mac's memory pressure. Level 2 (warning) is normal on a Mac in daily use, so only level 4
+  (critical) stops a run: if the run has called d3, it asks Ollama to free it; it records the run as deferred, and a later run picks the session
+  up again. The SessionEnd hook starts the scoring of each ended session this way, in the background.
+  `friction --since <date> --project all` scores and lists older sessions; see the cost in
+  [the reference](docs/reference.md#friction-local-macos). `gopola doctor` says which ended sessions are still
+  unscored.
 
 ## Configuration
 
@@ -215,8 +247,9 @@ gopola works with no model at all. Two optional features use one:
 | `GOPOLA_DB` | `~/.local/share/gopola/gopola.db` | the index |
 | `GOPOLA_PROJECTS` | `~/.claude/projects` | where transcripts are read from |
 | `GOPOLA_EXCLUDED_PROJECTS` | none | comma-separated project names or path fragments to skip |
-| `GOPOLA_OLLAMA` | `http://localhost:11434` | the Ollama server for meaning search |
+| `GOPOLA_OLLAMA` | `http://localhost:11434` | the Ollama server for meaning search, `ask` and `friction` |
 | `GOPOLA_EMBED_MODEL` | `embeddinggemma-2:270m` | the embedding model |
+| `GOPOLA_SYSCTL` | `/usr/sbin/sysctl` | the program that `friction` runs to read the Mac's memory pressure; set, it is also the pressure source on a machine that is not macOS |
 | `CLAUDE_PROJECT_DIR` | the launch directory | overrides the project for scripted sessions |
 
 ## Cloud sessions
@@ -262,8 +295,13 @@ claude-mem runs on every tool call, and keeps the same `<private>` convention an
 - **Count skill calls.** `src/insight.rs` provides `skills`, from the indexed commands. Not built: skill calls in
   subagent transcripts, or Codex skills. Add count rules to `src/insight.rs`.
 - **Search by meaning.** `src/embed.rs` and `src/cmds.rs` rank sessions by words and local vectors. Not built:
-  `ask`, friction detection, or in-process embeddings. Add vector logic to `src/embed.rs` and query behavior to
-  `src/cmds.rs`.
+  in-process embeddings. Add vector logic to `src/embed.rs` and query behavior to `src/cmds.rs`.
+- **Answer a question with one turn.** `src/ask.rs` reads the search hits and chooses the answer and its sentence;
+  `src/rerank.rs` scores texts with the local reranker; `src/eval.rs` scores `ask` on an eval set. Not built:
+  `ask` outside macOS, or a chat model. Add answer rules to `src/ask.rs` and scoring to
+  `src/eval.rs`.
+- **Find friction.** `src/friction.rs` scores typed prompts with d3 and a classifier trained on your confirmed labels.
+  Not built: scoring the reply, or prompts of 2,000 characters or more or over 3,900 bytes. Add scoring rules to `src/friction.rs`.
 - **Ignore whitespace in blame and show line ranges.** `src/authored.rs` does both. Not built: moved-line or
   copied-line detection. Add blame behavior to `src/authored.rs`.
 - **Search commands and filter turns.** `src/index.rs` stores command data; `src/cmds.rs` handles
@@ -317,3 +355,35 @@ Update `README.md`, `docs/reference.md`, and `skills/gopola/SKILL.md`.
 ## Licence
 
 MIT or Apache-2.0, at your choice. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+### Third-party
+
+The macOS binary includes llama.cpp and ggml, which are MIT-licensed:
+
+> MIT License
+>
+> Copyright (c) 2023-2026 The ggml authors
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+
+`gopola ask --setup` downloads Qwen3-Reranker-0.6B (Apache 2.0, by Qwen; the GGUF file is by ggml-org) from Hugging
+Face. gopola does not distribute it.
+
+`gopola friction` and `gopola embed` ask your Ollama for two models and do not distribute them: d3 (`d3:4b-nvfp4`) is
+Apache 2.0, and EmbeddingGemma 2 (`embeddinggemma-2:270m`) is Apache 2.0.

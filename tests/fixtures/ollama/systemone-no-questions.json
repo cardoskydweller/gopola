@@ -1,0 +1,10 @@
+{
+  "about": "d3's route with no questions: 400",
+  "source": "ollama 0.40.16 at localhost:11434, 2026-11-17, status and body",
+  "path": "/v1/systemone",
+  "request": {"model": "d3:4b-nvfp4"},
+  "status": 400,
+  "keys_include": ["error"],
+  "error_contains": "questions must contain",
+  "response": {"error": "questions must contain 1–64 fields"}
+}

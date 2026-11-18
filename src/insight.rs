@@ -388,11 +388,11 @@ pub fn doctor(o: &Opts) -> Res {
         .unwrap_or_else(|| format!("{}/.claude", std::env::var("HOME").unwrap_or_default()));
     let settings: Value = std::fs::read_to_string(format!("{config}/settings.json")).ok()
         .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    // Each hook is looked for under its own event. SessionEnd runs two of gopola's hooks; the line names the first one missing.
+    // Each hook is looked for under its own event. SessionEnd runs three of gopola's hooks; the line names the first one missing.
     for (event, needles) in [("SessionStart", &["gopola index --quiet && "][..]), ("UserPromptSubmit", &["gopola index --quiet"][..]),
                              ("PreToolUse", &["gopola file --hook"][..]), ("PostToolUse", &["gopola index --quiet"][..]),
                              ("Stop", &["gopola summarize --auto"][..]),
-                             ("SessionEnd", &["gopola summarize --auto --final", "gopola embed --quiet"][..])] {
+                             ("SessionEnd", &["gopola summarize --auto --final", "gopola embed --quiet", "gopola friction --auto"][..])] {
         let commands: Vec<&str> = settings["hooks"][event].as_array().into_iter().flatten()
             .flat_map(|g| g["hooks"].as_array().into_iter().flatten()).filter_map(|h| h["command"].as_str()).collect();
         findings.push(match needles.iter().find(|n| !commands.iter().any(|c| c.contains(*n))) {
@@ -434,8 +434,7 @@ pub fn doctor(o: &Opts) -> Res {
                 (select count(*) from vectors v join turns t on t.session_id = v.session_id and t.n = v.n where v.model = ?1)",
         [&e.model], |r| Ok((r.get(0)?, r.get(1)?)))?;
     // A session still open (its last event under 30 minutes ago) is embedded by its SessionEnd hook, not by hand.
-    let open_cutoff = crate::cmds::iso_from_secs(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs()).unwrap_or(0).saturating_sub(1800));
+    let open_cutoff = secs_ago(1800);
     let open_missing: i64 = c.query_row(
         "select count(*) from turns t join sessions s on s.id = t.session_id
          where s.ended_at >= ?2 and not exists
@@ -449,6 +448,7 @@ pub fn doctor(o: &Opts) -> Res {
         Ok(_) => ("ok", format!("ollama answers at {} with {}", e.base, e.model)),
         Err(err) => ("fix", err.to_string()),
     });
+    findings.push(crate::friction::doctor_line(&c, crate::friction::has_pressure_source())?);
     // What the session-start block costs for this project, in lines and characters.
     let project = crate::cmds::default_project();
     if let Ok(out) = std::process::Command::new(std::env::current_exe().unwrap_or_default())
@@ -567,7 +567,12 @@ fn stale_transcripts(c: &Connection) -> usize {
     stale
 }
 
+/// The ISO timestamp `secs` before now.
+pub(crate) fn secs_ago(secs: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    crate::cmds::iso_from_secs(now.saturating_sub(secs))
+}
+
 fn days_ago(n: u64) -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    crate::cmds::iso_from_secs(secs.saturating_sub(n * 86_400))
+    secs_ago(n * 86_400)
 }

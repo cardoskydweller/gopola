@@ -1,11 +1,20 @@
 //! Meaning search: turn text into vectors through a local Ollama server, and rank by cosine.
-//! The only network call gopola makes, and only to GOPOLA_OLLAMA (default http://localhost:11434).
+//! gopola's own HTTP calls go only to GOPOLA_OLLAMA (default http://localhost:11434): `/api/embed` for vectors,
+//! `/v1/systemone` for d3's scores in `friction`, and `/api/generate` to free d3's memory; `ask --setup` downloads the
+//! reranker with the system curl.
 
 use rusqlite::params;
 use serde_json::{json, Value};
 
 /// Small (346 MB loaded), 10 turns a second on an M1 Pro; measured 2026-10-13.
 pub const DEFAULT_MODEL: &str = "embeddinggemma-2:270m";
+/// How long Ollama keeps the model loaded after a request: a search after a short break finds it loaded, at the
+/// cost of about 350 MB held meanwhile.
+pub const KEEP_ALIVE: &str = "30m";
+/// d3 is about 4 GB loaded: a run of calls finds it loaded, and it is gone 30 s after the last one.
+const NOUL_KEEP_ALIVE: &str = "30s";
+/// Room for the state and the question; the load, and the memory held, grow with it.
+const NOUL_NUM_CTX: u32 = 4096;
 const DOC_PREFIX: &str = "title: none | text: ";
 const QUERY_PREFIX: &str = "task: search result | query: ";
 /// What a turn is embedded from: the start of its prompt and of its reply. The probe used these cuts.
@@ -86,6 +95,9 @@ pub enum EmbedError {
     /// Any other answer, or a peer that hung up mid-answer: another status, a body that is not JSON, or
     /// not one embedding per input. Carries ureq's or the server's own words.
     Bad(String),
+    /// Ollama refused this one input (a 4xx other than the missing model, or a `noul` that is not a probability):
+    /// the server is fine, and the next input may be answered.
+    Rejected(String),
 }
 
 impl std::fmt::Display for EmbedError {
@@ -94,6 +106,7 @@ impl std::fmt::Display for EmbedError {
             EmbedError::Unreachable(m) => write!(f, "ollama not reachable at {m} (open Ollama.app or run `ollama serve`)"),
             EmbedError::ModelMissing(m) => write!(f, "model {m} is not pulled (ollama pull {m})"),
             EmbedError::Bad(m) => write!(f, "ollama answered unexpectedly: {m}"),
+            EmbedError::Rejected(m) => write!(f, "ollama refused this input: {m}"),
         }
     }
 }
@@ -154,7 +167,7 @@ impl Embedder {
         }
         let url = format!("{}/api/embed", self.base);
         let mut r = self.agent.post(&url).config().timeout_global(Some(timeout)).build()
-            .send_json(json!({"model": self.model, "input": texts, "truncate": true}))
+            .send_json(json!({"model": self.model, "input": texts, "truncate": true, "keep_alive": KEEP_ALIVE}))
             .map_err(|e| self.failed(&url, e))?;
         let status = r.status().as_u16();
         let v: Value = r.body_mut().read_json().map_err(|e| self.failed(&format!("{url}: status {status}"), e))?;
@@ -176,9 +189,52 @@ impl Embedder {
             Ok(x)
         }).collect()
     }
+
+    /// POST `body` to `{base}{path}`: the url (for messages), the status and the JSON answer, whatever the status.
+    fn post_json(&self, path: &str, body: Value, timeout: std::time::Duration) -> Result<(String, u16, Value), EmbedError> {
+        let url = format!("{}{path}", self.base);
+        let mut r = self.agent.post(&url).config().timeout_global(Some(timeout)).build()
+            .send_json(body).map_err(|e| self.failed(&url, e))?;
+        let status = r.status().as_u16();
+        let v: Value = r.body_mut().read_json().map_err(|e| self.failed(&format!("{url}: status {status}"), e))?;
+        Ok((url, status, v))
+    }
+
+    /// d3's probability, in [0, 1], that `state` answers `question` yes (a `noul` question). d3 stays loaded
+    /// for 30 s after the call (about 4 GB), so a run of calls pays the load once. Waits up to 120 s.
+    pub fn noul(&self, model: &str, state: &str, question: &Value) -> Result<f64, EmbedError> {
+        let body = json!({"model": model, "state": state, "questions": {"friction": question},
+                          "keep_alive": NOUL_KEEP_ALIVE, "options": {"num_ctx": NOUL_NUM_CTX}});
+        let (url, status, v) = self.post_json("/v1/systemone", body, std::time::Duration::from_secs(120))?;
+        let err = v["error"].as_str().unwrap_or("");
+        if status == 404 && err.contains("not found") {
+            return Err(EmbedError::ModelMissing(model.to_string()));
+        }
+        let refusal = format!("{url}: status {status}: {err}");
+        match status {
+            200 => {}
+            400..=499 => return Err(EmbedError::Rejected(refusal)),
+            _ => return Err(EmbedError::Bad(refusal)),
+        }
+        let noul = &v["answers"]["friction"]["noul"];
+        match noul.as_f64() {
+            // abs: -0.0 is in range, but total_cmp (ranks, ties) puts it below 0.0
+            Some(n) if (0.0..=1.0).contains(&n) => Ok(n.abs()),
+            _ => Err(EmbedError::Rejected(format!("{url}: noul {noul}"))),
+        }
+    }
+
+    /// Free `model`'s memory at once (`keep_alive` 0), instead of the 30 s that `noul` leaves it loaded.
+    pub fn unload(&self, model: &str) -> Result<(), EmbedError> {
+        let (url, status, v) = self.post_json("/api/generate", json!({"model": model, "keep_alive": 0}), std::time::Duration::from_secs(10))?;
+        if status != 200 {
+            return Err(EmbedError::Bad(format!("{url}: status {status}: {}", v["error"].as_str().unwrap_or(""))));
+        }
+        Ok(())
+    }
 }
 
-const BATCH: usize = 16;
+pub const BATCH: usize = 16;
 
 /// `gopola embed [--limit N] [--quiet] [--json]`: embed every turn whose vector is missing or was made
 /// from different text, newest first, 16 per request, each batch committed on its own so a killed hook
@@ -347,5 +403,160 @@ mod tests {
         let e = Embedder::from_env();
         let err = rank_turns(&c, &e, "q", "all", "", "9999", 10).unwrap_err().to_string();
         assert!(err.starts_with("database error: ") && !err.contains("ollama"), "{err}");
+    }
+
+    const D3: &str = "d3:4b-nvfp4";
+
+    /// An Embedder aimed at a one-shot server that answers `status` and `body`, and the thread that returns
+    /// the request line and JSON body that the server received.
+    fn one_shot(status: &str, body: &str) -> (Embedder, std::thread::JoinHandle<(String, Value)>) {
+        one_shot_with(status, "", body)
+    }
+
+    /// `one_shot`, with `headers` (each line ending in `\r\n`) added to the answer.
+    fn one_shot_with(status: &str, headers: &str, body: &str) -> (Embedder, std::thread::JoinHandle<(String, Value)>) {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut e = Embedder::from_env();
+        e.base = format!("http://{}", listener.local_addr().unwrap());
+        let answer = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len());
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                reader.read_line(&mut h).unwrap();
+                if h.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut sent = vec![0u8; len];
+            reader.read_exact(&mut sent).unwrap();
+            stream.write_all(answer.as_bytes()).unwrap();
+            (line, serde_json::from_slice(&sent).unwrap())
+        });
+        (e, seen)
+    }
+
+    fn question() -> Value {
+        json!({"type": "noul", "instructions": "Is it a correction?", "criteria": {"false": "no", "true": "yes"}})
+    }
+
+    #[test]
+    fn noul_sends_keep_alive_and_num_ctx() {
+        let (e, seen) = one_shot("200 OK", r#"{"answers":{"friction":{"type":"noul","noul":0.25}}}"#);
+        assert_eq!(e.noul(D3, "state text", &question()).unwrap(), 0.25);
+        let (line, body) = seen.join().unwrap();
+        assert!(line.starts_with("POST /v1/systemone "), "{line}");
+        assert_eq!(body["model"], D3);
+        assert_eq!(body["state"], "state text");
+        assert_eq!(body["keep_alive"], "30s");
+        assert_eq!(body["options"]["num_ctx"], 4096);
+        assert_eq!(body["questions"]["friction"], question());
+    }
+
+    /// Turn text goes to GOPOLA_OLLAMA only: a 302 or 307 is an answer like any other, and its `Location` is never visited.
+    #[test]
+    fn no_call_follows_a_redirect() {
+        use std::io::Write;
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let location = format!("Location: http://{}/api/embed\r\n", elsewhere.local_addr().unwrap());
+        let visited = Arc::new(AtomicBool::new(false));
+        let flag = visited.clone();
+        // If a redirect were followed, this server answers at once, so the call ends and the flag tells.
+        std::thread::spawn(move || while let Ok((mut stream, _)) = elsewhere.accept() {
+            flag.store(true, Ordering::SeqCst);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        });
+        type Call = fn(&Embedder) -> Result<(), EmbedError>;
+        let calls: [Call; 3] = [
+            |e| e.embed(&["x".to_string()]).map(drop),
+            |e| e.noul(D3, "s", &question()).map(drop),
+            |e| e.unload(D3),
+        ];
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            for call in calls {
+                let (e, seen) = one_shot_with(status, &location, "{}");
+                let result = call(&e);
+                seen.join().unwrap();
+                assert!(!visited.load(Ordering::SeqCst), "{status}: a redirect was followed");
+                let err = result.unwrap_err();
+                assert!(matches!(&err, EmbedError::Bad(m) if m.contains(&format!("status {}", &status[..3]))), "{status}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn noul_refuses_a_score_outside_zero_to_one() {
+        for score in ["1.5", "-0.1", r#""high""#, "null"] {
+            let (e, seen) = one_shot("200 OK", &format!(r#"{{"answers":{{"friction":{{"noul":{score}}}}}}}"#));
+            let err = e.noul(D3, "s", &question()).unwrap_err();
+            seen.join().unwrap();
+            assert!(matches!(&err, EmbedError::Rejected(m) if m.contains("noul")), "{score}: {err}");
+        }
+        // 1e999 is not a finite number: serde_json refuses to read the body, and that is a bad answer.
+        let (e, seen) = one_shot("200 OK", r#"{"answers":{"friction":{"noul":1e999}}}"#);
+        assert!(matches!(e.noul(D3, "s", &question()), Err(EmbedError::Bad(_))));
+        seen.join().unwrap();
+        for score in ["0", "1"] {
+            let (e, seen) = one_shot("200 OK", &format!(r#"{{"answers":{{"friction":{{"noul":{score}}}}}}}"#));
+            assert!(e.noul(D3, "s", &question()).is_ok(), "{score} is a score");
+            seen.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn noul_tells_a_missing_model_from_any_other_refusal() {
+        let (e, seen) = one_shot("404 Not Found", r#"{"error":"model 'd3:4b-nvfp4' not found"}"#);
+        assert!(matches!(e.noul(D3, "s", &question()), Err(EmbedError::ModelMissing(m)) if m == D3));
+        seen.join().unwrap();
+        // A 404 that is not about the model, and a 400, refuse this input and carry the server's words.
+        let (e, seen) = one_shot("404 Not Found", r#"{"error":"no such route"}"#);
+        assert!(matches!(e.noul(D3, "s", &question()), Err(EmbedError::Rejected(m)) if m.contains("status 404: no such route")));
+        seen.join().unwrap();
+        let (e, seen) = one_shot("400 Bad Request", r#"{"error":"questions must contain 1–64 fields"}"#);
+        assert!(matches!(e.noul(D3, "s", &question()), Err(EmbedError::Rejected(m)) if m.contains("status 400: questions must contain")));
+        seen.join().unwrap();
+    }
+
+    #[test]
+    fn noul_reads_a_negative_zero_as_zero() {
+        // total_cmp, which ranks and ties use, puts -0.0 below 0.0: two equal scores would not tie
+        let (e, seen) = one_shot("200 OK", r#"{"answers":{"friction":{"noul":-0.0}}}"#);
+        assert!(e.noul(D3, "s", &question()).unwrap().is_sign_positive());
+        seen.join().unwrap();
+    }
+
+    #[test]
+    fn noul_maps_a_400_to_rejected_and_a_500_to_bad() {
+        let (e, seen) = one_shot("400 Bad Request", r#"{"error":"x"}"#);
+        assert!(matches!(e.noul(D3, "s", &question()), Err(EmbedError::Rejected(m)) if m.contains("status 400: x")));
+        seen.join().unwrap();
+        let (e, seen) = one_shot("500 Internal Server Error", r#"{"error":"x"}"#);
+        assert!(matches!(e.noul(D3, "s", &question()), Err(EmbedError::Bad(m)) if m.contains("status 500: x")));
+        seen.join().unwrap();
+    }
+
+    #[test]
+    fn unload_sends_keep_alive_zero() {
+        let (e, seen) = one_shot("200 OK", r#"{"model":"d3:4b-nvfp4","done":true,"done_reason":"unload"}"#);
+        e.unload(D3).unwrap();
+        let (line, body) = seen.join().unwrap();
+        assert!(line.starts_with("POST /api/generate "), "{line}");
+        assert_eq!(body, json!({"model": D3, "keep_alive": 0}));
+    }
+
+    #[test]
+    fn unload_refuses_a_non_200() {
+        let (e, seen) = one_shot("500 Internal Server Error", r#"{"error":"boom"}"#);
+        assert!(matches!(e.unload(D3), Err(EmbedError::Bad(m)) if m.contains("status 500: boom")));
+        seen.join().unwrap();
     }
 }

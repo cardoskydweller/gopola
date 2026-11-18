@@ -1,0 +1,9 @@
+{
+  "about": "unload a loaded model at once (keep_alive 0); answered in under 2 ms",
+  "source": "ollama 0.40.16 at localhost:11434, 2026-11-17, d3:4b-nvfp4 loaded",
+  "path": "/api/generate",
+  "request": {"model": "d3:4b-nvfp4", "keep_alive": 0},
+  "status": 200,
+  "keys_include": ["model", "done", "done_reason"],
+  "response": {"model": "d3:4b-nvfp4", "created_at": "2026-11-17T16:45:11.757704Z", "response": "", "done": true, "done_reason": "unload"}
+}

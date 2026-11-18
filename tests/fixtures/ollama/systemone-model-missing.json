@@ -1,0 +1,13 @@
+{
+  "about": "d3's route with a model that is not pulled: 404 naming it",
+  "source": "ollama 0.40.16 at localhost:11434, 2026-11-17, status and body",
+  "path": "/v1/systemone",
+  "request": {"model": "no-such-model:1b", "state": "no, that is wrong again, I told you to run the tests before committing",
+    "questions": {"friction": {"type": "noul", "instructions": "Is the developer correcting the AI assistant, pointing out its mistake or missed step, repeating an earlier instruction, or showing frustration with how it worked?",
+      "criteria": {"false": "A new request, an answer, an approval or a question, with no correction", "true": "The developer corrects or pushes back on the assistant"}}},
+    "keep_alive": "30s", "options": {"num_ctx": 4096}},
+  "status": 404,
+  "keys_include": ["error"],
+  "error_contains": "not found",
+  "response": {"error": "model 'no-such-model:1b' not found"}
+}

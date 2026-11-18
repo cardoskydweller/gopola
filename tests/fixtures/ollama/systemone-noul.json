@@ -1,0 +1,14 @@
+{
+  "about": "d3's one noul question on an invented prompt: 200 with a probability",
+  "source": "ollama 0.40.16 at localhost:11434, 2026-11-17, d3:4b-nvfp4 cold (4.83 s with the load)",
+  "path": "/v1/systemone",
+  "request": {"model": "d3:4b-nvfp4", "state": "no, that is wrong again, I told you to run the tests before committing",
+    "questions": {"friction": {"type": "noul", "instructions": "Is the developer correcting the AI assistant, pointing out its mistake or missed step, repeating an earlier instruction, or showing frustration with how it worked?",
+      "criteria": {"false": "A new request, an answer, an approval or a question, with no correction", "true": "The developer corrects or pushes back on the assistant"}}},
+    "keep_alive": "30s", "options": {"num_ctx": 4096}},
+  "status": 200,
+  "keys_include": ["model", "answers", "usage"],
+  "noul": true,
+  "response": {"model": "d3:4b-nvfp4", "answers": {"friction": {"type": "noul", "noul": 0.9939322458491318}},
+    "usage": {"input_tokens": 149, "output_tokens": 0}, "prompt_eval_cached_count": 0}
+}
