@@ -1,0 +1,6 @@
+{"id": "eeeeeeee:1", "session_id": "eeeeeeee-0000-0000-0000-000000000001", "n": 1, "prompt": "no, that is wrong", "label": "not_friction", "group": "invented"}
+{"id": "eeeeeeee:2", "session_id": "eeeeeeee-0000-0000-0000-000000000001", "n": 2, "prompt": "add a dark mode toggle", "label": "not_friction", "group": "invented"}
+{"id": "eeeeeeee:3", "session_id": "eeeeeeee-0000-0000-0000-000000000002", "n": 1, "prompt": "I told you to run the tests first", "label": "correction", "group": "invented"}
+{"id": "eeeeeeee:4", "session_id": "eeeeeeee-0000-0000-0000-000000000002", "n": 2, "prompt": "thanks, ship it", "label": "not_friction", "group": "invented"}
+{"id": "eeeeeeee:5", "session_id": "eeeeeeee-0000-0000-0000-000000000003", "n": 1, "prompt": "wrong file again", "label": "correction", "group": "invented"}
+{"id": "eeeeeeee:6", "session_id": "eeeeeeee-0000-0000-0000-000000000003", "n": 2, "prompt": "what does this flag do?", "label": "not_friction", "group": "invented"}

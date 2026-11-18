@@ -8,7 +8,7 @@ Every command, what it prints, and how it gets its facts. The [README](../README
 - [Finding past work](#finding-past-work): `search`, `show`, `timeline`, `recent`, `file`, `digest`, `tools`, `skills`
 - [Inside a session](#inside-a-session): `commands`, `dispatches`, `hooks`, `handback`, `weight`
 - [Code from sessions](#code-from-sessions): `authored`, `blame`
-- [Model calls](#model-calls): `summarize`, `embed`
+- [Model calls](#model-calls): `summarize`, `embed`, `ask`, `eval ask`, `friction`, `eval friction`
 - [Cloud sessions](#cloud-sessions): `import`
 - [Other commands](#other-commands): `index`, `import-claude-mem`, `version`
 - [Limits](#limits)
@@ -18,7 +18,8 @@ Common rules:
 - Every command takes `--json`.
 - A session is named by any unique prefix of its id (`5ca1ab1e`).
 - `--project P` picks a project by name. `--project all` searches every project. The default is the project of the
-  current directory.
+  current directory; `ask` is the exception and searches all projects unless `--project` is given. `friction --since`
+  follows the default.
 - `--since D` and `--until D` take a date (`2026-10-01`).
 - Exit codes: `0` success, `1` what you asked about is missing or in a bad state, `2` misuse.
 
@@ -39,7 +40,9 @@ says exactly that is left alone, and any other is rewritten. When the Codex fold
 `hooks.json` and keeps every other handler there (see [Codex CLI](#codex-cli)); if that fails, the install warns and
 goes on.
 
-gopola needs Rust stable and git. SQLite with full-text search is compiled in. Meaning search also needs
+gopola needs Rust stable and git. On macOS the build also needs CMake (`brew install cmake`) and the Xcode Command
+Line Tools (`xcode-select --install`), because it compiles llama.cpp for `ask`; Linux needs neither. SQLite with
+full-text search is compiled in. Meaning search also needs
 [Ollama](https://ollama.com) with the model pulled (`ollama pull embeddinggemma-2:270m`). Without Ollama, everything
 works except `embed` and the meaning half of `search`.
 
@@ -61,7 +64,8 @@ Add these to `~/.claude/settings.json`:
     {"type": "command", "command": "$HOME/.local/bin/gopola summarize --auto", "timeout": 120, "async": true}]}],
   "SessionEnd": [{"hooks": [
     {"type": "command", "command": "$HOME/.local/bin/gopola summarize --auto --final", "timeout": 120},
-    {"type": "command", "command": "$HOME/.local/bin/gopola embed --quiet", "timeout": 120}]}]
+    {"type": "command", "command": "$HOME/.local/bin/gopola embed --quiet", "timeout": 120},
+    {"type": "command", "command": "$HOME/.local/bin/gopola friction --auto", "timeout": 10}]}]
 }
 ```
 
@@ -72,11 +76,12 @@ Add these to `~/.claude/settings.json`:
 | PreToolUse (Read) | `file --hook` | Tells the session when a different session edited the file it is about to read. |
 | PostToolUse (edits) | `index --quiet`, async | Indexes after each `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, so another session's Read hook sees the edit when it happens. No model call, no copy of the tool's output. |
 | Stop | `summarize --auto` | Summarises a long session every 20 turns. See [Model calls](#model-calls). |
-| SessionEnd | `summarize --auto --final`, `embed --quiet` | A last summary if the session grew, then meaning-search vectors for its new turns. |
+| SessionEnd | `summarize --auto --final`, `embed --quiet`, `friction --auto` | A last summary if the session grew, then meaning-search vectors for its new turns, then the start of the session's friction scoring in a background process of its own (see [`friction`](#friction-local-macos)). |
 
 Every hook form exits 0, so a broken index never stops a session. Errors go to stderr. The hook forms print
 nothing when they have nothing to say: `recent` for a project with no sessions, `file --hook` for a file with no
-history, `summarize --auto` always.
+history, `summarize --auto` always, and `friction --auto` unless it cannot open the database (it then says
+`gopola: <the error>` on stderr, and still exits 0).
 
 `index` and `recent` are the core. The other hooks are optional.
 
@@ -109,7 +114,7 @@ and prints nothing when it fails or has nothing to say.
 Checks, one line each:
 
 - whether the index is current (transcripts not yet indexed);
-- each of the six hook events (for SessionEnd, which of its two hooks is missing), in `$CLAUDE_CONFIG_DIR` when it
+- each of the six hook events (for SessionEnd, which of its three hooks is missing), in `$CLAUDE_CONFIG_DIR` when it
   is set;
 - whether the skill is linked;
 - when the Copilot folder exists, four Copilot lines: whether a `*.json` file in its `hooks` folder runs
@@ -124,12 +129,17 @@ Checks, one line each:
   read, per session, and how many Codex sessions there are, by CLI version. A rollout Codex has compressed is read
   through; one that only gopola's archive still holds is left out;
 - how many turns have meaning-search vectors, and whether Ollama answers;
+- friction scoring, one line: how many deferred and failed runs the last 30 days hold, and whether any session that
+  ended more than 30 minutes ago in that time still has unscored prompts. If some do, the line gives the
+  `gopola friction --since <date> --project all` that scores them and what it costs. A run still in progress is not
+  counted as a failure. On a machine that cannot read memory pressure (not macOS, and no `GOPOLA_SYSCTL`), the line
+  says that scoring runs on macOS only and how many sessions were skipped;
 - searches that found nothing in the last 30 days, and long sessions with no summary.
 
-gopola logs every query command locally: `search`, `recent`, `show`, `file` (and `file --hook`), `timeline` (and
+gopola logs every query command locally: `search`, `ask`, `recent`, `show`, `file` (and `file --hook`), `timeline` (and
 `timeline --query`), `tools`, `skills`, `digest`, `commands`, `dispatches`, `hooks`, `weight`, `authored`, `blame` and `embed`. It logs
 the command, its argument and the hit count; nothing leaves the machine. `doctor` reads that log to show what gopola failed to
-answer.
+answer. A friction scoring run leaves one row of its own in the same log (see [`friction`](#friction-local-macos)).
 
 ### The skill
 
@@ -346,7 +356,7 @@ ancestor's. The tests use it.
 ### The tables
 
 `gopola.db` is one SQLite file. gopola upgrades an older database in place when it opens it, and records the schema
-version (9) in `meta`.
+version (10) in `meta`.
 
 | Table | One row per | What it holds |
 |---|---|---|
@@ -356,11 +366,13 @@ version (9) in `meta`.
 | `commits` | commit made during a session | The sha, timestamp and subject. |
 | `fts` | piece of searchable text | A full-text index (SQLite FTS5, with stemming) of every prompt, reply, turn's commands, title, summary, commit subject and imported observation, with its kind, what it points at (`<session>:<turn>`, a sha or an observation id), its project and its timestamp. |
 | `fts_ref` | row of `fts` | Its kind and what it points at, so a turn's rows are removed without scanning the index. |
-| `vectors` | turn and embedding model | The meaning-search vector, and a hash of the text it was made from. |
+| `vectors` | turn and embedding model | The meaning-search vector, and a hash of the text it was made from. `friction` keeps the classifier's vectors here too, under the model name `<embedding model>+classification`, so they never mix with the meaning-search ones. |
+| `scores` | typed prompt and scoring model | d3's score for the prompt (0 to 1), a hash of the text it was scored from, and when; or, when d3 refused the prompt, no score and the refusal in `error`, so the prompt is not asked again until its text changes. |
+| `labels` | turn | The verdict (`correction`, `borderline` or `not_friction`), where it came from (`import` or `retro`), when, and whether it is `confirmed`. The classifier trains on confirmed rows only. |
 | `observations` | imported claude-mem observation | What `import-claude-mem` copied. |
 | `moves` | moved checkout | The old path and the new one, from `gopola moved`. |
 | `injected` | session and file | That `file --hook` has told that session about that file, so it says so once. |
-| `usage` | query command run | The command, its argument and how many hits it had; `doctor` reads it. |
+| `usage` | query command run, and friction scoring run | The command, its argument and how many hits it had; `doctor` reads it. A friction run's row says how it ended (see [`friction`](#friction-local-macos)). |
 | `meta` | setting | The schema version, and per harness the record types `index` could not place, each with the first session that held it: `copilot_unknown_types` and `codex_unknown_types`. |
 
 ## Finding past work
@@ -821,7 +833,7 @@ The path can be a file that is on the ref but not on disk.
 
 ## Model calls
 
-gopola works without any model. Two commands use one.
+gopola works without any model. Four commands use one.
 
 ### `summarize` (cloud)
 
@@ -850,10 +862,251 @@ embedded twice. It uses no quota.
 |---|---|
 | `GOPOLA_OLLAMA` | `http://localhost:11434` |
 | `GOPOLA_EMBED_MODEL` | `embeddinggemma-2:270m` |
+| `GOPOLA_SYSCTL` | `/usr/sbin/sysctl` |
 
-The default model is about 350 MB while loaded. Ollama unloads it after five idle minutes, so the first search after
-that waits about a second. `--quiet` is the hook form: it always exits 0, and when Ollama is down it prints one line
+`GOPOLA_OLLAMA` also serves `ask` and `friction`. `GOPOLA_SYSCTL` is `friction`'s: the program that it runs to read the
+Mac's memory pressure (see [`friction`](#friction-local-macos)); when it is set, it is also the pressure source on a
+machine that is not macOS.
+
+The default model is about 350 MB while loaded. gopola asks Ollama to keep it loaded 30 minutes after each request, so
+the first search after a longer break waits about a second. `--quiet` is the hook form: it always exits 0, and when Ollama is down it prints one line
 on stderr.
+
+### `ask` (local, macOS)
+
+    gopola ask <question> [--project P] [--since D] [--until D]
+    gopola ask --setup
+
+Prints the one turn that answers the question and its key sentence, or `not found`:
+
+    c0ffee42:7  We kept the 30 minute keep-alive because the first search after a break waited a second.
+
+The first field is the turn's reference (`show` and `timeline` open it). With `--json` the keys are `found`, `ref`,
+`session`, `turn`, `sentence` and `score`; a `not found` has `found: false`, null `ref`, `session`, `turn` and
+`sentence`, and the score of the best hit. The question is every word after `ask`, so it needs no quotes.
+
+How it chooses:
+
+1. It searches as `search` does (words and meaning together) and keeps the 8 best hits. `--project`, `--since` and
+   `--until` narrow that search. **Unlike `search`, `ask` searches all projects unless `--project` is given.** The
+   numbers below were measured that way.
+2. The reranker scores each hit against the question. A turn is scored on its prompt and its reply, each cut to the
+   first 600 characters; a commit or a summary is scored on its snippet.
+3. When the best-scoring hit is not a turn (a commit, a summary), the answer is `not found`. On the eval set that
+   rule left 42 good outcomes minus wrong citations; answering with the best-scoring turn among the hits left 39.
+4. When the turn that may answer scores under 0.99659204, the answer is `not found`. That threshold is the one
+   that gave the most good outcomes minus wrong citations on the eval set: a wrong citation costs more than `not found`.
+5. The key sentence is the best-scoring sentence of that turn's whole prompt and reply (the first 300 sentences),
+   any sentence being allowed.
+
+A turn that `ask` prints is always one of the 8 hits. `ask` changes nothing in the index; it logs one `usage` row (the
+command, the question, and whether it found a turn), as `search` does.
+
+`ask` loads the reranker (Qwen3-Reranker-0.6B, Q8_0) into this process through llama.cpp and Metal. It holds about
+1.3 GB at peak (1,344 MB measured) while it runs and frees it when it exits; nothing stays resident. The first run after a download
+compiles Metal shaders, about 6 s once. With Ollama down, the search says so on stderr and uses words, as `search` does.
+
+`--setup` downloads the model once, from Hugging Face, with the system `/usr/bin/curl` (HTTPS only, at most 5
+redirects, at most the model's size). The URL names one commit of the repository, and gopola checks the finished
+file's size (639,153,184 bytes) and sha256 before it moves the file into place, so a damaged or swapped download
+installs nothing. `--setup` on a model already in place checks it and downloads nothing; `--json` prints
+`model`, `bytes`, `sha256` and `downloaded`.
+
+The model lives beside the database as `qwen3-reranker-0.6b-q8_0.gguf` (`~/.local/share/gopola/` by default), so
+`GOPOLA_DB` moves it with the database. If `--setup` is stopped with Ctrl-C, a partial
+`qwen3-reranker-0.6b-q8_0.gguf.part` of up to 639 MB stays beside the database until the next `--setup` overwrites
+it. Delete it by hand to free the space.
+
+Exit codes: `0` for an answer and for `not found`; `1` when the model is not set up or fails the check (the
+message says `run gopola ask --setup`), the question has no words or is too long to score, the download fails,
+or the platform is not macOS (`gopola ask needs macOS`); `2` for an unknown flag placed before `ask`, and for
+`--setup` given with question words (`gopola ask what does --setup do`: `--setup` is a gopola flag, so the command is
+refused and nothing downloads). After `ask`, a word that starts with `-` and is not a gopola flag joins the question.
+Before it loads a model file, `ask` checks
+its size and GGUF header, because llama.cpp can abort the process on a damaged header; only `--setup` checks the
+sha256.
+
+### `eval ask` (macOS)
+
+    gopola eval ask --dir <eval folder>
+
+Scores `ask` on a folder of questions and prints numbers, refs and ids, never a turn's words. It needs the
+reranker (`ask --setup`), a database with vectors (`gopola embed`) and Ollama up, because it measures words and
+meaning together and refuses when meaning search is off.
+
+The folder holds `ask.jsonl`, one question per line, and `ask-sentences.json`. A question has `id`, `exact` and
+`reworded` (the two phrasings), `expect` (`answer` or `refusal`), `gold` (the turn references that answer it),
+`gold_sessions`, `until` (the search's `--until`, so a later turn cannot be the answer), and optionally `exclude`
+(session prefixes left out of the hits). `ask-sentences.json` maps a question id to its gold turns, each with the
+sentences that count as the key sentence. A `local/` folder beside them is read too: `local/ask-client.jsonl` adds
+questions, and `local/ask-sentences.json` replaces `ask-sentences.json` when it exists. The report gives every
+question as `all`, and the questions from `ask.jsonl` alone as `committed`.
+
+Every phrasing is searched as `ask` searches (8 hits, all projects) and reranked once, then scored under both
+rules for a top hit that is not a turn: `not_found` (what `ask` does) and `best_turn` (answer with the best-scoring
+turn among the hits). Each phrasing is judged at the threshold fitted on every other question, leaving out both phrasings
+of the question being scored, so a number never rests on a threshold fitted to the same question.
+
+| Measure | JSON key | What it counts |
+|---|---|---|
+| right first turn | `right_first_turn` | answer phrasings where the turn cited is a gold turn |
+| top-1 session | `top1_session` | answer phrasings where the cited turn is in a gold session |
+| wrong first cites | `wrong_first_cites` | phrasings that cite a turn that is not gold (any cite for a question with no answer) |
+| absent cited | `absent_cited` | phrasings of questions with no answer that were given a citation |
+| good outcomes | `good` | the gold turn cited, or `not found` when the question has no answer or its gold turn is not among the hits |
+| good minus wrong | `good_minus_wrong` | good outcomes minus wrong first cites: the number the rules are compared by |
+| invented refs | `invented_refs` | cited references that are not among the hits (always 0 by construction) |
+| sentence score | `sentence` | per sentence rule (`quote_filter`, `length`, `all`), the key sentences that are a gold sentence, over answer phrasings whose candidate turn is a gold turn with listed sentences |
+
+Time is measured over every phrasing but the first, which pays for warming the model: the median and 90th percentile
+of search plus reranking, and of reranking alone, and the slowest phrasing of all. Peak memory is the process's
+greatest physical footprint, the figure Activity Monitor shows. The text report ends with the rule kept, the one
+with the higher good minus wrong; a tie keeps `not_found`.
+
+`--json` prints `phrasings`, `questions`, `load_s`, `time` (`warm_phrasings`, `search_rerank_median_s`,
+`search_rerank_p90_s`, `rerank_median_s`, `rerank_p90_s`, `slowest_search_rerank_s`, `slowest_id`,
+`slowest_phrasing`), `peak_footprint_mb`, `non_turn` (for `not_found` and `best_turn`: `threshold_fit_on_all`,
+`thresholds_loo`, and `sets` with `all` and `committed`, each holding the measures above), `non_turn_kept`, and `rows`
+(per phrasing: `id`, `phrasing`, `top`, `best_turn`, `score`). A threshold that answers every question or none
+is written `-inf` or `inf`. Exit codes: `0` when it ran; `1` without `--dir`, without vectors, with meaning search
+off, with a malformed file in the folder, or off macOS.
+
+### `friction` (local, macOS)
+
+    gopola friction --session <prefix> [-n 10]
+    gopola friction --since D [--project P|all] [-n 10]
+    gopola friction --import-labels <file>
+    gopola friction --label <ref> <label>
+    gopola friction --confirm <ref> [<label>]
+    gopola friction --pending
+    gopola friction --auto
+
+Finds the prompts of yours that were corrections of a session: you pointing out a mistake or a missed step, repeating
+an instruction, or showing frustration with how the assistant worked. Give one form at a time. `--session` and
+`--since` score and then list; the others keep the labels the classifier learns from, or run as a hook.
+
+**The scoring run** (`--session` or `--since`, with `--quiet` for the hook form):
+
+1. It takes the lock (below), then brings the index up to date.
+2. It scores each prompt in scope that has no current score. A prompt is one you typed, not a reply. It is left out
+   when its session is a scripted run, when it is 2,000 characters or longer or over 3,900 bytes, when it starts with
+   `<` (a command or tag), or when it starts with `This session is being continued`. `--session` takes the one session
+   whose id starts with the prefix (more than one, or none, is a failed run). `--since` takes every session of
+   `--project` that has a turn at or after the date, all of its prompts; the list shows only the prompts from the date
+   on. **`--project` is the current project, as everywhere: unlike `ask`, `friction --since` does not cover all projects
+   unless you give `--project all`.**
+3. d3 (`d3:4b-nvfp4`, `ollama pull d3:4b-nvfp4`) scores each prompt through Ollama's `/v1/systemone` (at `GOPOLA_OLLAMA`),
+   asked whether the developer is correcting the assistant. The answer is a probability from 0 to 1. A call waits up to
+   120 s. d3 is about 4 GB loaded and up to about 6.4 GB at peak (3,941 MB at the end of a run and 6,419 MB at the peak, measured); each call asks Ollama to keep it for 30 s, so a run pays the load once and
+   Ollama frees it 30 s after the last prompt. A score is kept with a hash of the prompt's text, so a prompt is not
+   scored again unless its text changes. When d3 refuses a prompt (a 4xx answer, or a score outside 0 to 1) the prompt is
+   marked in `scores.error` and not asked again until its text changes. Any other error (Ollama not reachable, a 5xx
+   answer, d3 not pulled) stops the run as `failed`.
+4. It then gives the prompts, and every confirmed-labelled turn, a classification vector from the embedding model, 16 to
+   a request, kept after each request. The text embedded is `task: classification | query: ` and the prompt.
+
+**The pressure guard.** The run reads macOS's memory pressure (`kern.memorystatus_vm_pressure_level`: 1 normal, 2
+warning, 4 critical) before it starts and before each prompt. Level 2 is normal on a Mac in daily use, so only 4
+stops a run. At 4 it stops, asks Ollama to free d3 at once if it had called d3 (that request's answer changes
+nothing), and records the run as `deferred`; what it scored is kept. A pressure it cannot read also defers the run.
+`GOPOLA_SYSCTL` names the program that is run as `$GOPOLA_SYSCTL -n kern.memorystatus_vm_pressure_level` in place
+of `/usr/sbin/sysctl` (without a shell); setting it also lets a machine that is not macOS score, which is how the tests
+run. On any other machine with it unset the run is `skipped`.
+
+**The lock.** One scoring run takes the lock `gopola.db.friction.lock`, beside the database, and never waits for it:
+a second run records `deferred` (`another friction run is in progress`). The lock goes when the process ends, so a
+killed run leaves nothing to clean up. `eval friction` takes the same lock.
+
+**The list.** After the run, the scored prompts in scope are listed, likeliest correction first, 10 unless `-n` says
+otherwise:
+
+    0.91  d3 0.88  clf 0.93  c0ffee42:7   demo-app  2026-11-10 09:12  no, that is not what I asked for  [correction ✓]
+    classifier: trained on 42 confirmed labels
+
+The first number is the rank score (FR-3), then d3's score and the classifier's (`-` when it did not score), the turn's
+reference (`show` opens it), project, time and the prompt's first line (at most 100 characters). A label that the turn
+has follows, `✓` when confirmed and `?` when not. FR-3 turns each method's scores into ranks over all the prompts that
+it scored in the database (the scope only picks which are printed), and takes the mean of the two ranks with equal
+weights; a prompt the classifier did not score keeps its d3 rank. The classifier is a logistic regression over the
+classification vectors (regularisation C = 1.0, balanced class weights), trained at each listing on the confirmed
+labels that have a current vector, with `correction` the positive class and `borderline` and `not_friction` the
+negative. It stays off, and the last line says so, until the confirmed labels hold both a correction and a prompt that
+is not one. `--json` prints `outcome`, `detail`, `scored` (the prompts this run scored), `classifier_labels` and
+`prompts`, each with `ref`, `session_id`, `n`, `project`, `ts`, `prompt`, `d3`, `classifier`, `rank`, `label` and
+`confirmed`.
+
+**How a run is recorded.** Each run writes a row to `usage` before it starts and turns it into its outcome when it
+ends, so a run that is killed leaves `friction-failed` with `did not finish`. The command is
+`friction-scored`, `friction-deferred`, `friction-failed` or `friction-skipped`, the argument is `<scope>: <detail>`
+(the scope is the session's full id, or `since D <project>`; the detail is at most 200 characters) and the hits are
+the prompts newly scored. `friction-skipped` is what a machine with no pressure source records: the SessionEnd hook
+runs wherever your settings are, and on a Linux machine, such as a cloud session that carries them, it records one such
+row per session. A text-mode run that ends `deferred`, `failed` or `skipped` prints its list, then one line on stderr
+(`gopola: friction deferred: …`), and exits 1. `--quiet` prints nothing on stdout, scores the session or window and
+exits 0 on every path.
+
+**The cost of a first `--since` run.** With d3 held in memory a prompt takes about 0.43 s, the figure `doctor` uses.
+4,500 prompts are about 32 minutes, so start with `--since` seven days back, and `--project all` only when you mean it.
+A run that defers continues the next time it is run, because scored prompts are kept.
+
+**The labels** are the verdicts that the classifier trains on. A label is on a turn, named by its reference
+`<session prefix>:<turn>` (the prefix must name exactly one session and the turn must exist).
+
+- `--import-labels <file>` reads a JSON object of `"<ref>": {"label": …}` and stores each row as confirmed. The whole
+  file is checked first: the first bad row (a value that is not an object with a `label`, a label that is not one of
+  the three, a reference that names no turn, a second key for a turn that an earlier key labelled differently) refuses
+  the file, naming the key and its line (the second key names the first), and nothing is written.
+  A file over 8 MiB is refused before it is parsed. It prints `imported N labels` (`--json`: `{"imported": N}`).
+- `--label <ref> <label>` records a verdict that waits for a yes (`source` `retro`, not confirmed). It never changes a
+  confirmed label: it says `kept the confirmed label …` instead.
+- `--confirm <ref> [<label>]` is the yes, with a different label when one is given. It needs an existing label.
+- `--pending` lists the labels that wait for a yes, oldest first, with each turn's first line (`--json`: `pending`).
+
+**The SessionEnd form.** `--auto` reads the hook's JSON on stdin and starts `friction --session <session_id> --quiet` as
+a process of its own (its own process group, no stdin, stdout or stderr, never waited for), then returns at once. A hook
+that is killed does not take the scoring with it. The session id must be letters, digits and hyphens, at most 64;
+anything else starts nothing. It says nothing and always exits 0, except that a database that cannot be opened is
+said on stderr (`gopola: <the error>`); what else goes wrong is a `friction-failed` row
+(`the hook sent no session_id`, `invalid session id …`, `could not start: …`). The detached run also scores what earlier
+runs left, unless its own run deferred: up to five other sessions, newest first, whose latest row in the last 7 days is
+`deferred` or `failed` (a `did not finish` row under an hour old is a run in progress and is left alone). A row's
+scope is read as the one session it names, so a prefix that was typed by hand and the session's id are one session;
+a prefix that names none or several is left alone. It stops at the first deferral. When it cannot read the rows, it
+records a `friction-failed` row that says so, which `doctor` shows.
+
+Exit codes: `0` for the label forms that worked and for a scoring run that scored; `1` for a refused file, an unknown
+ref or label, two forms at once, no form, and a scoring run that deferred, failed or was skipped. Anything printed from
+transcript text or an Ollama message has control characters written out, so that it cannot move a terminal.
+
+### `eval friction` (macOS)
+
+    gopola eval friction --dir <eval folder>
+
+Scores friction mining on a folder of labelled prompts and prints ids and numbers, never a prompt's words. It opens
+no database. It needs Ollama up with d3 and the embedding model pulled, and takes the scoring lock.
+
+The folder holds `friction.jsonl`, one prompt per line with string `id`, `session_id` and `prompt` (other keys are
+ignored), and `friction-labels-confirmed.json`, an object of `"<id>": {"label": …}`. A `local/` folder beside them is
+read too: `local/friction-client.jsonl` adds prompts, and `local/friction-labels-confirmed.json` replaces the labels file
+when it exists. A prompt with no confirmed label is an error, and a `label` that a row carries itself is not read. Each
+file is read through an 8 MiB bound.
+
+d3 is asked once for each prompt, with the pressure read before each call. The classifier is scored leave-one-session-out:
+each session's prompts by a model trained on every other session's. `correction` is the positive class; `borderline`
+counts as not a correction. The report gives, for d3, the classifier and FR-3 (the mean rank of the two), the average
+precision (AP) over all prompts and the corrections found in the top 20 per 100 prompts (k = the larger of 1 and the
+prompts × 20 / 100, rounded; inside a tie at the cut, the count expected from random order). For d3 and the classifier it also
+gives how many prompts a score of 0.5 or more flags, and the precision and recall of those flags. A last line gives each
+method's AP over the committed prompts alone (those from `friction.jsonl`) and the done line, `FR-3 AP <ap> >= 0.6 on all
+prompts` (the AP that it judges, to four decimals, where the table rounds to three), as `pass` or `fail`.
+
+`--json` prints `prompts`, `committed`, `corrections`, `borderline`, `methods` (`d3`, `classifier` and `fr3`, each with
+`ap`, `top20_found` and `top20_k`; `d3` and `classifier` also `flags`, `precision` and `recall`), `committed_ap` (null
+when the committed prompts hold no correction) and `done_line` (`fr3_ap_at_least` and `pass`). Exit codes: `0` when it
+ran, a failed done line included; `1` without `--dir`, off macOS, when no prompt is a correction (there is nothing to
+measure), when another friction run holds the lock, when memory pressure is critical or unreadable, when d3 refuses a
+prompt, when a held-out session leaves the others without a correction or without a prompt that is not one, or with a
+malformed file in the folder.
 
 ## Cloud sessions
 

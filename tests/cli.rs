@@ -65,11 +65,37 @@ fn gopola(w: &World, args: &[&str]) -> (bool, String, String) {
 
 /// `gopola` against a given Ollama and embedding model, with the exit code (`embed` tests need it).
 fn gopola_with(w: &World, ollama: &str, model: &str, args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_gopola"))
-        .env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects)
+    gopola_run(world_command(w, ollama, model).args(args))
+}
+
+/// `gopola_with`, with every proxy variable (upper and lower case) set to `proxy`. ureq reads them with no loopback
+/// exemption, and gopola sends turn text to GOPOLA_OLLAMA only: with `proxy` at a closed port, a run that honoured
+/// them could not reach `ollama`.
+fn gopola_via_proxy(w: &World, ollama: &str, model: &str, proxy: &str, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = world_command(w, ollama, model);
+    set_proxy(&mut cmd, proxy);
+    gopola_run(cmd.args(args))
+}
+
+/// Every proxy variable, upper and lower case, set to `proxy`, and no exception list that could let a call past it.
+fn set_proxy(cmd: &mut Command, proxy: &str) {
+    for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        cmd.env(var, proxy);
+    }
+    cmd.env_remove("NO_PROXY").env_remove("no_proxy");
+}
+
+fn world_command(w: &World, ollama: &str, model: &str) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gopola"));
+    cmd.env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects)
         .env("GOPOLA_OLLAMA", ollama).env("GOPOLA_EMBED_MODEL", model)
         .env("CLAUDE_CONFIG_DIR", w.base.join("claude")).env("COPILOT_HOME", w.base.join("copilot")).env("CODEX_HOME", w.base.join("codex"))
-        .current_dir(&w.repo).args(args).output().unwrap();
+        .current_dir(&w.repo);
+    cmd
+}
+
+fn gopola_run(cmd: &mut Command) -> (i32, String, String) {
+    let out = cmd.output().unwrap();
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into())
 }
 
@@ -493,11 +519,19 @@ fn moved_checkout_keeps_its_history_under_the_new_name() {
     let real = fs::canonicalize(&new).unwrap().to_string_lossy().replace('/', "-");
     fs::rename(w.projects.join(old.replace('/', "-")), w.projects.join(real)).unwrap();
 
-    for args in [&["recent", "-n", "10"][..], &["index", "--full"][..], &["recent", "-n", "10"][..]] {
+    for (step, args) in [&["recent", "-n", "10"][..], &["index", "--full"][..], &["recent", "-n", "10"][..]].into_iter().enumerate() {
         let (ok, out, err) = gopola(&w, args);
         assert!(ok, "{err}");
-        if args[0] == "recent" {
-            assert!(out.starts_with("# gopola: renamed-app,") && out.contains("aaaa0001") && out.contains("bbbb0002"), "{out}");
+        if args[0] == "recent" && !(out.starts_with("# gopola: renamed-app,") && out.contains("aaaa0001") && out.contains("bbbb0002")) {
+            // Fails only on GitHub's macOS runner so far: show every row and folder, to find where the session went.
+            let rows: Vec<String> = rusqlite_open(&w.db)
+                .prepare("select id, project, coalesce(worktree, ''), coalesce(launch_dir, ''), coalesce(path, '') from sessions").unwrap()
+                .query_map([], |r| Ok(format!("{}|{}|{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))).unwrap()
+                .collect::<Result<_, _>>().unwrap();
+            let folders: Vec<String> = fs::read_dir(&w.projects).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            let (_, all, _) = gopola(&w, &["recent", "--project", "all", "-n", "10"]);
+            panic!("step {step}: {out}\nrows: {rows:#?}\nfolders: {folders:#?}\ntemp: {}\nall: {all}", std::env::temp_dir().display());
         }
     }
     let (_, out, _) = gopola(&w, &["search", "uploader"]);
@@ -525,13 +559,19 @@ fn doctor_checks_each_hook_under_its_own_event_in_claude_config_dir() {
     fs::create_dir_all(claude.join("skills/gopola")).unwrap();
     fs::write(claude.join("skills/gopola/SKILL.md"), "x").unwrap();
     let hook = |cmd: &str| format!(r#"[{{"hooks":[{{"type":"command","command":"$HOME/.local/bin/gopola {cmd}"}}]}}]"#);
-    let settings = |post: &str| format!(r#"{{"hooks":{{"SessionStart":{},"UserPromptSubmit":{},"PreToolUse":{},{post}"Stop":{},"SessionEnd":[{{"hooks":[{{"type":"command","command":"gopola summarize --auto --final"}},{{"type":"command","command":"gopola embed --quiet"}}]}}]}}}}"#,
+    let settings = |post: &str| format!(r#"{{"hooks":{{"SessionStart":{},"UserPromptSubmit":{},"PreToolUse":{},{post}"Stop":{},"SessionEnd":[{{"hooks":[{{"type":"command","command":"gopola summarize --auto --final"}},{{"type":"command","command":"gopola embed --quiet"}},{{"type":"command","command":"gopola friction --auto"}}]}}]}}}}"#,
         hook("index --quiet && gopola recent"), hook("index --quiet"), hook("file --hook"), hook("summarize --auto"));
 
     fs::write(claude.join("settings.json"), settings("")).unwrap();
     let (_, out, _) = gopola(&w, &["doctor"]);
     assert!(out.contains("fix   PostToolUse hook missing: `gopola index --quiet`")
         && out.contains("ok    UserPromptSubmit hook wired") && out.contains("ok    gopola skill installed"), "{out}");
+
+    let without = settings("").replace(r#",{"type":"command","command":"gopola friction --auto"}"#, "");
+    assert_ne!(without, settings(""));
+    fs::write(claude.join("settings.json"), without).unwrap();
+    let (_, out, _) = gopola(&w, &["doctor"]);
+    assert!(out.contains("fix   SessionEnd hook missing: `gopola friction --auto`"), "{out}");
 
     fs::write(claude.join("settings.json"), settings(&format!(r#""PostToolUse":{},"#, hook("index --quiet")))).unwrap();
     let (_, out, _) = gopola(&w, &["doctor"]);
@@ -663,7 +703,8 @@ fn replay_ollama_fixtures(base: &str, exact_row_len: bool) -> usize {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         assert!(readme.contains(&format!("`{name}`")), "{name} is not described in the README");
         let f: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        let mut r = agent.post(format!("{base}/api/embed")).send_json(&f["request"]).unwrap();
+        let path = f["path"].as_str().unwrap_or("/api/embed");
+        let mut r = agent.post(format!("{base}{path}")).send_json(&f["request"]).unwrap();
         let status = u64::from(r.status().as_u16());
         let body: serde_json::Value = r.body_mut().read_json().unwrap();
         assert_eq!(status, f["status"].as_u64().unwrap(), "{name}: {body}");
@@ -680,6 +721,10 @@ fn replay_ollama_fixtures(base: &str, exact_row_len: bool) -> usize {
                     _ => assert!(len > 0, "{name}: an empty row"),
                 }
             }
+        }
+        if f["noul"].as_bool() == Some(true) {
+            let n = body["answers"]["friction"]["noul"].as_f64().unwrap_or(f64::NAN);
+            assert!((0.0..=1.0).contains(&n), "{name}: noul {n} in {body}");
         }
         if let Some(e) = f["error_contains"].as_str() {
             assert!(body["error"].as_str().unwrap_or("").contains(e), "{name}: {body}");
@@ -703,21 +748,19 @@ fn embed_fills_vectors_once_per_turn() {
 }
 
 /// ureq reads HTTP_PROXY and friends with no loopback exemption; gopola sends turn text to GOPOLA_OLLAMA only.
-/// The proxy variables point at the closed port, so a client that honoured them could not embed.
+/// The proxy variables point at the closed port, so a client that honoured them could not embed, nor embed the
+/// question that `search` and `ask` look up by meaning.
 #[test]
-fn embed_ignores_proxy_variables() {
+fn embed_and_search_ignore_proxy_variables() {
     let w = two_topic_world();
     let fake = FakeOllama::start(8, MODEL);
     gopola(&w, &["index", "--quiet"]);
-    let out = Command::new(env!("CARGO_BIN_EXE_gopola"))
-        .env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects)
-        .env("GOPOLA_OLLAMA", &fake.url).env("GOPOLA_EMBED_MODEL", MODEL)
-        .env("HTTP_PROXY", NO_OLLAMA).env("HTTPS_PROXY", NO_OLLAMA).env("ALL_PROXY", NO_OLLAMA)
-        .env("http_proxy", NO_OLLAMA).env("https_proxy", NO_OLLAMA).env("all_proxy", NO_OLLAMA)
-        .env("COPILOT_HOME", w.base.join("copilot")).env("CODEX_HOME", w.base.join("codex")).current_dir(&w.repo).args(["embed"]).output().unwrap();
-    let (out_s, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert_eq!(out.status.code(), Some(0), "{err}");
-    assert!(out_s.contains("embedded 2 turns"), "{out_s}");
+    let (code, out, err) = gopola_via_proxy(&w, &fake.url, MODEL, NO_OLLAMA, &["embed"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("embedded 2 turns"), "{out}");
+    let (code, out, err) = gopola_via_proxy(&w, &fake.url, MODEL, NO_OLLAMA, &["search", "running", "on", "my", "laptop", "-n", "1"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("aaaaaaaa:1"), "only meaning finds this turn: {out}");
 }
 
 #[test]
@@ -850,45 +893,117 @@ fn every_embed_error_is_produced_by_a_fixture_or_a_rude_mode() {
         .map(|l| l.split(|ch: char| !ch.is_alphanumeric()).next().unwrap()).collect();
     let w = two_topic_world();
     gopola(&w, &["index", "--quiet"]);
-    // (variant, what produces it, the Ollama gopola talks to, what its error says)
-    let cases: Vec<(&str, &str, String, &[&str])> = vec![
-        ("Unreachable", "nothing listening", NO_OLLAMA.to_string(), &["ollama not reachable at http://127.0.0.1:9"]),
-        ("ModelMissing", "model-missing.json", FakeOllama::start(8, "some-other-model").url,
+    // (variant, what produces it, the Ollama gopola talks to, whether `friction` (d3) or `embed` talks to it,
+    // the exit code, what its error, or the outcome and marker rows that `friction` leaves, say)
+    type Case<'a> = (&'a str, &'a str, String, bool, i32, &'a [&'a str]);
+    let cases: Vec<Case> = vec![
+        ("Unreachable", "nothing listening", NO_OLLAMA.to_string(), false, 1, &["ollama not reachable at http://127.0.0.1:9"]),
+        ("ModelMissing", "model-missing.json", FakeOllama::start(8, "some-other-model").url, false, 1,
             &["model embeddinggemma-2:270m is not pulled (ollama pull embeddinggemma-2:270m)"]),
-        ("Bad", "Rude::Status500", FakeOllama::start_rude(8, MODEL, Rude::Status500).url,
+        ("Bad", "Rude::Status500", FakeOllama::start_rude(8, MODEL, Rude::Status500).url, false, 1,
             &["ollama answered unexpectedly", "status 500"]),
-        ("Bad", "Rude::WrongRowCount", FakeOllama::start_rude(8, MODEL, Rude::WrongRowCount).url,
+        ("Bad", "Rude::WrongRowCount", FakeOllama::start_rude(8, MODEL, Rude::WrongRowCount).url, false, 1,
             &["ollama answered unexpectedly", "1 embeddings for 2 inputs"]),
-        ("Bad", "Rude::HangUp", FakeOllama::start_rude(8, MODEL, Rude::HangUp).url,
+        ("Bad", "Rude::HangUp", FakeOllama::start_rude(8, MODEL, Rude::HangUp).url, false, 1,
             &["ollama answered unexpectedly", "Peer disconnected"]),
+        ("Unreachable", "nothing listening (friction)", NO_OLLAMA.to_string(), true, 1,
+            &["ollama not reachable at http://127.0.0.1:9", "friction-failed"]),
+        ("ModelMissing", "systemone-model-missing.json, Rude::NoDecisionModel", FakeOllama::start_rude(8, MODEL, Rude::NoDecisionModel).url, true, 1,
+            &["ollama pull d3:4b-nvfp4", "friction-failed"]),
+        ("Bad", "Rude::Status500 on /v1/systemone", FakeOllama::start_rude(8, MODEL, Rude::Status500).url, true, 1,
+            &["ollama answered unexpectedly", "status 500", "friction-failed"]),
+        ("Bad", "Rude::HangUp on /v1/systemone", FakeOllama::start_rude(8, MODEL, Rude::HangUp).url, true, 1,
+            &["ollama answered unexpectedly", "Peer disconnected", "friction-failed"]),
+        ("Rejected", "Rude::NoulOutOfRange: a marker row, the run goes on", FakeOllama::start_rude(8, MODEL, Rude::NoulOutOfRange).url, true, 0,
+            &["noul 1.5", "friction-scored"]),
+        ("Rejected", "systemone-no-questions.json's 400, Rude::RejectState", FakeOllama::start_rude(8, MODEL, Rude::RejectState("ollama")).url, true, 0,
+            &["status 400: rejected", "friction-scored"]),
     ];
     for v in &variants {
         assert!(cases.iter().any(|c| c.0 == *v), "EmbedError::{v} is produced by no fixture or rude mode");
     }
-    for (variant, how, url, says) in &cases {
-        let (code, _, err) = gopola_with(&w, url, MODEL, &["embed"]);
-        assert_eq!(code, 1, "{variant} via {how}: {err}");
+    for (variant, how, url, d3, want, says) in &cases {
+        let (code, text) = if *d3 {
+            // each friction case in a world of its own: a marker row from one would stop the next from asking d3
+            let fw = two_topic_world();
+            pressure_scripts(&fw);
+            assert!(gopola(&fw, &["index", "--quiet"]).0);
+            let (code, _, err) = friction_at(&fw, url, "sysctl-1", &["--session", "aaaaaaaa"]);
+            let stored: String = rusqlite_open(&fw.db).query_row(
+                "select (select coalesce(group_concat(cmd || ' ' || arg, ' '), '') from usage where cmd like 'friction-%')
+                     || ' ' || (select coalesce(group_concat(error, ' '), '') from scores)", [], |r| r.get(0)).unwrap();
+            fs::remove_dir_all(&fw.base).unwrap();
+            (code, format!("{err} {stored}"))
+        } else {
+            let (code, _, err) = gopola_with(&w, url, MODEL, &["embed"]);
+            (code, err)
+        };
+        assert_eq!(code, *want, "{variant} via {how}: {text}");
         for s in says.iter() {
-            assert!(err.contains(s), "{variant} via {how}: {err}");
+            assert!(text.contains(s), "{variant} via {how}: {text}");
         }
     }
 }
 
 #[test]
-fn ollama_fixtures_hold_for_the_fake() {
+fn every_embed_request_asks_ollama_to_keep_the_model_30_minutes() {
+    let w = two_topic_world();
     let fake = FakeOllama::start(8, MODEL);
-    assert_eq!(replay_ollama_fixtures(&fake.url, false), 4);
+    gopola(&w, &["index", "--quiet"]);
+    gopola_with(&w, &fake.url, MODEL, &["embed"]);
+    gopola_with(&w, &fake.url, MODEL, &["search", "laptop"]);
+    let bodies = fake.bodies.lock().unwrap();
+    assert!(bodies.len() >= 2, "embed and search each send one: {bodies:?}");
+    assert!(bodies.iter().all(|b| b["keep_alive"] == "30m"), "{bodies:?}");
 }
 
 #[test]
-#[ignore = "needs a real Ollama with embeddinggemma-2:270m; run by hand (plan Task 4)"]
+fn ollama_fixtures_hold_for_the_fake() {
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(replay_ollama_fixtures(&fake.url, false), 8);
+}
+
+/// What the fake does beyond the captured answers: d3's noul by the state's words, the rude modes that only
+/// touch `/v1/systemone`, and the unload counter. The friction loop's tests rely on each of these.
+#[test]
+fn the_fake_answers_d3_by_state_and_counts_unloads() {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).max_redirects(0).build().into();
+    let ask = |url: &str, model: &str, state: &str| -> (u16, serde_json::Value) {
+        let q = fixture("systemone-noul")["request"]["questions"].clone();
+        let mut r = agent.post(format!("{url}/v1/systemone"))
+            .send_json(serde_json::json!({"model": model, "state": state, "questions": q})).unwrap();
+        (r.status().as_u16(), r.body_mut().read_json().unwrap())
+    };
+    let noul = |b: &serde_json::Value| b["answers"]["friction"]["noul"].as_f64().unwrap();
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(noul(&ask(&fake.url, fake_ollama::DECISION_MODEL, "No, that is WRONG").1), 0.9);
+    assert_eq!(noul(&ask(&fake.url, fake_ollama::DECISION_MODEL, "I told you twice").1), 0.9);
+    assert_eq!(noul(&ask(&fake.url, fake_ollama::DECISION_MODEL, "please add a test").1), 0.1);
+    let (status, body) = ask(&fake.url, "other:1b", "x");
+    assert_eq!((status, body["error"].as_str().unwrap()), (404, "model 'other:1b' not found"));
+    assert_eq!(fake.systemone.lock().unwrap().len(), 4);
+    assert_eq!(fake.requests.load(std::sync::atomic::Ordering::SeqCst), 0, "systemone is not an embed request");
+
+    let out_of_range = FakeOllama::start_rude(8, MODEL, Rude::NoulOutOfRange);
+    assert_eq!(noul(&ask(&out_of_range.url, fake_ollama::DECISION_MODEL, "x").1), 1.5);
+    let no_model = FakeOllama::start_rude(8, MODEL, Rude::NoDecisionModel);
+    assert_eq!(ask(&no_model.url, fake_ollama::DECISION_MODEL, "x").0, 404);
+
+    let unload = |url: &str| agent.post(format!("{url}/api/generate"))
+        .send_json(serde_json::json!({"model": fake_ollama::DECISION_MODEL, "keep_alive": 0})).unwrap().status().as_u16();
+    assert_eq!(unload(&fake.url), 200);
+    assert_eq!(fake.unloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+#[ignore = "needs a real Ollama with embeddinggemma-2:270m and d3:4b-nvfp4; run by hand. The d3 replay loads d3 (about 4 GB, held 30 s); unload-d3.json runs after systemone-noul.json (files run in name order) and unloads it"]
 fn ollama_contract_real_server() {
     // The same fixtures, against the real server, with the captured row length held exactly.
     let base = std::env::var("GOPOLA_OLLAMA").unwrap_or_else(|_| "http://localhost:11434".into());
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).max_redirects(0).build().into();
     let version = agent.get(format!("{base}/api/version")).call().unwrap().body_mut().read_to_string().unwrap();
     println!("ollama at {base}: {version}");
-    assert_eq!(replay_ollama_fixtures(&base, true), 4);
+    assert_eq!(replay_ollama_fixtures(&base, true), 8);
     // And gopola end to end against it.
     let w = two_topic_world();
     gopola(&w, &["index", "--quiet"]);
@@ -4018,5 +4133,1840 @@ fn context_refuses_a_claude_session() {
     let (ok, out, err) = gopola(&w, &["context", "0123abcd"]);
     assert!(!ok && out.is_empty(), "{out}");
     assert!(err.contains("context reads Copilot sessions only; 0123abcd is a Claude Code session, whose transcript holds no system prompt"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// The reranker model's name and size, as `gopola ask` pins them (the binary's own constants are out of reach here).
+#[cfg(target_os = "macos")]
+const RERANKER_FILE: &str = "qwen3-reranker-0.6b-q8_0.gguf";
+#[cfg(target_os = "macos")]
+const RERANKER_SIZE: u64 = 639_153_184;
+
+/// Puts the real reranker where `gopola ask` looks for it, beside the world's database.
+#[cfg(target_os = "macos")]
+fn reranker_world(w: &World) {
+    let model = std::env::var("GOPOLA_TEST_RERANKER").expect("GOPOLA_TEST_RERANKER is not set");
+    std::os::unix::fs::symlink(model, w.base.join(RERANKER_FILE)).unwrap();
+}
+
+/// One session whose first turn answers "which port should the walk server use" in `first_reply`, and a second turn
+/// about something else; indexed, with the real reranker in place.
+#[cfg(target_os = "macos")]
+fn walk_server_world(first_reply: &str) -> World {
+    let w = setup();
+    reranker_world(&w);
+    write_session(&w, "cccccccc-0000-0000-0000-000000000003", "2026-10-11T10:00:00.000Z",
+        &[("which port should the walk server use?", first_reply), ("what did we eat", "Pancakes.")]);
+    assert!(gopola(&w, &["index", "--quiet"]).0);
+    w
+}
+
+#[cfg(target_os = "macos")]
+const WALK_REPLY: &str = "Use port 8095 for the walk server. It is free on this Mac.";
+#[cfg(target_os = "macos")]
+const WALK_QUESTION: &str = "which port should the walk server use";
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ask_without_the_model_prints_the_setup_command() {
+    let w = setup();
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", "which", "port"]);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("gopola ask --setup"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// `--setup` among question words is refused before anything downloads. The proxy variables point at a closed port, so
+/// a run that did start the download would fail at once with exit 1, never fetch 639 MB.
+#[cfg(target_os = "macos")]
+#[test]
+fn ask_refuses_setup_among_question_words() {
+    let w = setup();
+    let (code, out, err) = gopola_via_proxy(&w, NO_OLLAMA, MODEL, NO_OLLAMA, &["ask", "what", "does", "--setup", "do"]);
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
+    assert!(err.contains("`gopola ask <question>` or `gopola ask --setup`"), "{err}");
+    let kept: Vec<_> = fs::read_dir(&w.base).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("qwen3")).collect();
+    assert!(kept.is_empty(), "nothing was fetched: {kept:?}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// `--setup` when curl fails: the download's partial file is removed, nothing is installed, the exit is 1. The proxy
+/// variables point at a closed port, so curl fails at once and nothing is fetched.
+#[cfg(target_os = "macos")]
+#[test]
+fn ask_setup_removes_the_part_file_when_curl_fails() {
+    let w = setup();
+    let part = w.base.join(format!("{RERANKER_FILE}.part"));
+    fs::write(&part, b"left by a stopped download").unwrap();
+    let (code, out, err) = gopola_via_proxy(&w, NO_OLLAMA, MODEL, NO_OLLAMA, &["ask", "--setup"]);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("curl exited 7; nothing was installed"), "{err}");
+    assert!(!part.exists() && !w.base.join(RERANKER_FILE).exists(), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// A file of the pinned size with a valid GGUF header whose counts are huge: llama.cpp's loader must refuse it, not abort.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_header_valid_garbage_model_fails_to_load() {
+    use std::io::Write;
+    let w = setup();
+    let mut f = fs::File::create(w.base.join(RERANKER_FILE)).unwrap();
+    f.write_all(b"GGUF").unwrap();
+    f.write_all(&3u32.to_le_bytes()).unwrap();
+    f.write_all(&(1u64 << 60).to_le_bytes()).unwrap();
+    f.write_all(&(1u64 << 60).to_le_bytes()).unwrap();
+    f.set_len(RERANKER_SIZE).unwrap();
+    let (code, _, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", "which", "port"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("could not load the reranker model"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn ask_cites_the_turn_and_its_sentence() {
+    let w = walk_server_world(WALK_REPLY);
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", WALK_QUESTION]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "cccccccc:1  Use port 8095 for the walk server.\n");
+    let (_, json, _) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", WALK_QUESTION, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!((v["found"].clone(), v["turn"].clone()), (true.into(), 1.into()), "{json}");
+    assert_eq!(v["session"], "cccccccc-0000-0000-0000-000000000003", "{json}");
+    assert!(v["score"].is_number(), "{json}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn ask_says_not_found_for_an_unrelated_question() {
+    let w = walk_server_world(WALK_REPLY);
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", "what colour is the sky on mars"]);
+    assert_eq!((code, out.as_str()), (0, "not found\n"), "{err}");
+    let (_, json, _) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", "what colour is the sky on mars", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["found"], false, "{json}");
+    for key in ["ref", "session", "turn", "sentence"] {
+        assert_eq!(v.get(key), Some(&serde_json::Value::Null), "{key} is null, not missing: {json}");
+    }
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// `ask` searches every project unless `--project` is given, from a folder that belongs to another project.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn ask_searches_all_projects_unless_one_is_given() {
+    let w = walk_server_world(WALK_REPLY);
+    let other = w.base.join("repos").join("other-app");
+    fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    let ask = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_gopola"))
+            .env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects).env("GOPOLA_OLLAMA", NO_OLLAMA)
+            .current_dir(&other).args(args).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let (code, out, err) = ask(&["ask", WALK_QUESTION]);
+    assert_eq!((code, out.as_str()), (Some(0), "cccccccc:1  Use port 8095 for the walk server.\n"), "{err}");
+    let (code, out, err) = ask(&["ask", WALK_QUESTION, "--project", "other-app"]);
+    assert_eq!((code, out.as_str()), (Some(0), "not found\n"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// A reply with an escape sequence in it reaches the terminal as text, never as a control byte.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn ask_prints_an_escape_sequence_inert() {
+    let w = walk_server_world("Use port \u{1b}[2J8095 for the walk server.");
+    let out = Command::new(env!("CARGO_BIN_EXE_gopola"))
+        .env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects).env("GOPOLA_OLLAMA", NO_OLLAMA)
+        .current_dir(&w.repo).args(["ask", WALK_QUESTION]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!out.stdout.contains(&0x1b), "{:?}", out.stdout);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("\\u{1b}[2J"), "{text}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// A sentence over one batch is not scored, and the turn still answers from its other sentences.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn a_sentence_over_the_batch_is_skipped() {
+    let w = walk_server_world(&format!("{WALK_REPLY}\n{}", "word ".repeat(3000)));
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", WALK_QUESTION]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "cccccccc:1  Use port 8095 for the walk server.\n");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn a_question_over_the_batch_is_refused() {
+    let w = walk_server_world(WALK_REPLY);
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", &"🦀".repeat(3000)]);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("the question is too long to score"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn ask_answers_from_words_when_ollama_is_down() {
+    let w = walk_server_world(WALK_REPLY);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = gopola_with(&w, &fake.url, MODEL, &["embed"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["ask", WALK_QUESTION]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("# meaning search off"), "{err}");
+    assert!(out.starts_with("cccccccc:1  "), "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn ask_and_eval_say_they_need_macos() {
+    let w = setup();
+    for args in [&["ask", "which", "port"][..], &["ask", "--setup"], &["eval", "ask", "--dir", "/nonexistent"]] {
+        let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, args);
+        assert_eq!((code, out.as_str()), (1, ""), "{args:?}: {err}");
+        assert_eq!(err, "gopola ask needs macOS (the reranker runs through Metal)\n", "{args:?}");
+    }
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_needs_a_dir() {
+    let w = setup();
+    for (args, want) in [(&["eval"][..], "eval needs `ask` or `friction`"), (&["eval", "nothing"], "eval needs `ask` or `friction`"),
+                         (&["eval", "friction"], "eval friction needs --dir <eval folder>")] {
+        let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, args);
+        assert_eq!((code, out.as_str()), (1, ""), "{args:?}: {err}");
+        assert!(err.contains(want), "{args:?}: {err}");
+    }
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// An invented eval folder: one `ask.jsonl` row per `(id, question, gold, expect)`, and an `ask-sentences.json` of `{}`.
+/// Every row carries an `answer` string, as the real rows do.
+#[cfg(target_os = "macos")]
+fn eval_dir(w: &World, rows: &[(&str, &str, &[&str], &str)]) -> PathBuf {
+    let dir = w.base.join("eval");
+    fs::create_dir_all(&dir).unwrap();
+    let lines: Vec<String> = rows.iter().map(|(id, q, gold, expect)| serde_json::json!({
+        "id": id, "status": "new", "exact": q, "reworded": format!("{q} please"), "gold": gold,
+        "gold_sessions": gold.iter().map(|g| g.split(':').next().unwrap()).collect::<Vec<_>>(),
+        "expect": expect, "answer": "an invented answer", "until": "2026-11-16", "exclude": [],
+    }).to_string()).collect();
+    fs::write(dir.join("ask.jsonl"), lines.join("\n") + "\n").unwrap();
+    fs::write(dir.join("ask-sentences.json"), "{}").unwrap();
+    dir
+}
+
+/// The walk-server session, indexed but not embedded, and an eval folder of one question about it.
+#[cfg(target_os = "macos")]
+fn eval_world() -> (World, PathBuf) {
+    let w = setup();
+    write_session(&w, "cccccccc-0000-0000-0000-000000000003", "2026-10-11T10:00:00.000Z",
+        &[("which port should the walk server use?", WALK_REPLY), ("what did we eat", "Pancakes.")]);
+    assert!(gopola(&w, &["index", "--quiet"]).0);
+    let dir = eval_dir(&w, &[("t01", WALK_QUESTION, &["cccccccc:1"], "answer")]);
+    (w, dir)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn eval_ask_refuses_when_meaning_search_is_off() {
+    let (w, dir) = eval_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = gopola_with(&w, &fake.url, MODEL, &["embed"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["eval", "ask", "--dir", &dir.to_string_lossy()]);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("meaning search is off (") && err.contains("the eval measures words and meaning together"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn eval_ask_refuses_without_vectors() {
+    let (w, dir) = eval_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = gopola_with(&w, &fake.url, MODEL, &["eval", "ask", "--dir", &dir.to_string_lossy()]);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains(&format!("no turn has a vector for {MODEL}: run `gopola embed`")), "{err}");
+    assert_eq!(fake.requests.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing was embedded, so Ollama is not asked");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn eval_ask_needs_a_dir() {
+    let w = setup();
+    let (code, out, err) = gopola_with(&w, NO_OLLAMA, MODEL, &["eval", "ask"]);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("eval ask needs --dir <eval folder>"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// The eval prints refs, ids and numbers, never a turn's words: the reply and the other turn's reply stay out of it.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn eval_ask_prints_no_turn_text() {
+    let w = walk_server_world(WALK_REPLY);
+    let dir = eval_dir(&w, &[("t01", WALK_QUESTION, &["cccccccc:1"], "answer"), ("x01", "what colour is the sky on mars", &[], "refusal")]);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = gopola_with(&w, &fake.url, MODEL, &["embed"]);
+    assert_eq!(code, 0, "{err}");
+    let args = ["eval", "ask", "--dir", &dir.to_string_lossy()];
+    let (code, out, err) = gopola_with(&w, &fake.url, MODEL, &args);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("threshold candidates: all phrasings") && out.contains("non-turn rule kept: "), "{out}");
+    let (code, json, err) = gopola_with(&w, &fake.url, MODEL, &[args.as_slice(), &["--json"]].concat());
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!((v["phrasings"].clone(), v["questions"].clone()), (4.into(), 2.into()), "{json}");
+    assert_eq!(v["non_turn"]["not_found"]["sets"]["all"]["invented_refs"], 0, "{json}");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 4, "{json}");
+    for text in [&out, &json] {
+        assert!(!text.contains("8095") && !text.contains("Pancakes"), "{text}");
+    }
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// A row's `exclude` drops the hits of those sessions before they are ranked: the same row cites a turn without it, and nothing with it.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs the reranker: GOPOLA_TEST_RERANKER=<gguf> cargo test --release -- --ignored"]
+fn eval_ask_leaves_out_the_excluded_sessions() {
+    let w = walk_server_world(WALK_REPLY);
+    let dir = eval_dir(&w, &[("t01", WALK_QUESTION, &["cccccccc:1"], "answer")]);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = gopola_with(&w, &fake.url, MODEL, &["embed"]);
+    assert_eq!(code, 0, "{err}");
+    let tops = |w: &World| {
+        let (code, json, err) = gopola_with(w, &fake.url, MODEL, &["eval", "ask", "--dir", &dir.to_string_lossy(), "--json"]);
+        assert_eq!(code, 0, "{err}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["rows"].as_array().unwrap().iter().map(|r| r["top"].clone()).collect::<Vec<_>>()
+    };
+    assert!(tops(&w).iter().all(|t| t.is_string()), "without the exclude, every phrasing cites a turn");
+    let rows = fs::read_to_string(dir.join("ask.jsonl")).unwrap();
+    fs::write(dir.join("ask.jsonl"), rows.replace("\"exclude\":[]", "\"exclude\":[\"cccccccc\"]")).unwrap();
+    assert!(tops(&w).iter().all(|t| t.is_null()), "with it, the only session is left out");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+const FA: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+const FB: &str = "bbbbbbbb-0000-0000-0000-000000000002";
+
+/// Sessions `FA` (turns 1-3) and `FB` (turn 1), indexed.
+fn friction_world() -> World {
+    let w = setup();
+    write_session(&w, FA, "2026-11-10T10:00:00.000Z", &[("first prompt", "r1"), ("second prompt", "r2"), ("third prompt", "r3")]);
+    write_session(&w, FB, "2026-11-11T10:00:00.000Z", &[("only prompt", "r4")]);
+    assert!(gopola(&w, &["index"]).0);
+    w
+}
+
+/// `gopola friction <args>`. The labels commands never read the Mac's memory pressure; a sysctl that does not
+/// exist means that no friction test could.
+fn friction(w: &World, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_gopola"))
+        .env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects).env("GOPOLA_OLLAMA", NO_OLLAMA)
+        .env("GOPOLA_SYSCTL", w.base.join("no-sysctl"))
+        .env("CLAUDE_CONFIG_DIR", w.base.join("claude")).env("COPILOT_HOME", w.base.join("copilot")).env("CODEX_HOME", w.base.join("codex"))
+        .current_dir(&w.repo).arg("friction").args(args).output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into())
+}
+
+/// Every label row: (session, turn, label, source, confirmed).
+fn label_rows(w: &World) -> Vec<(String, i64, String, String, i64)> {
+    let c = rusqlite_open(&w.db);
+    let mut st = c.prepare("select session_id, n, label, source, confirmed from labels order by session_id, n").unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap().flatten().collect()
+}
+
+fn write_labels(w: &World, text: &str) -> String {
+    let p = w.base.join("labels.json");
+    fs::write(&p, text).unwrap();
+    p.to_string_lossy().into()
+}
+
+#[test]
+fn import_labels_stores_confirmed_rows() {
+    let w = friction_world();
+    let f = write_labels(&w, r#"{"aaaaaaaa:1":{"label":"correction","by":"x"},"bbbbbbbb:1":{"label":"not_friction"}}"#);
+    let (code, out, err) = friction(&w, &["--import-labels", &f]);
+    assert_eq!((code, out.trim()), (0, "imported 2 labels"), "{err}");
+    assert_eq!(label_rows(&w), vec![
+        (FA.into(), 1, "correction".into(), "import".into(), 1),
+        (FB.into(), 1, "not_friction".into(), "import".into(), 1)]);
+    let v: String = rusqlite_open(&w.db).query_row("select v from meta where k = 'schema_version'", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, "10");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn import_labels_refuses_the_whole_file_on_one_bad_row() {
+    let w = friction_world();
+    let f = write_labels(&w, "{\n  \"aaaaaaaa:1\": {\"label\": \"correction\"},\n  \"bbbbbbbb:1\": {\"label\": \"borderline\"},\n  \"aaaaaaaa:9\": {\"label\": \"correction\"}\n}\n");
+    let (code, _, err) = friction(&w, &["--import-labels", &f]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("aaaaaaaa:9") && err.contains("line 4"), "{err}");
+    assert_eq!(label_rows(&w), vec![], "the two good rows are not written either");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn import_labels_refuses_a_label_outside_the_list() {
+    let w = friction_world();
+    for (text, names) in [
+        (r#"{"aaaaaaaa:1":{"label":"correction"},"bbbbbbbb:1":{"label":"angry"}}"#, "bbbbbbbb:1"),
+        (r#"{"aaaaaaaa:1":{"label":"correction"},"bbbbbbbb:1":"correction"}"#, "bbbbbbbb:1"),
+        (r#"{"aaaaaaaa:1":{"label":"correction"},"bbbbbbbb:1":{}}"#, "bbbbbbbb:1"),
+        (r#"{"aaaaaaaa:1":{"label":"correction"},"zzzz":{"label":"correction"}}"#, "zzzz"),
+        (r#"{"aaaaaaaa:1":{"label":"correction"},"zzzz:1":{"label":"correction"}}"#, "zzzz:1"),
+        (r#"["aaaaaaaa:1"]"#, "JSON object"),
+    ] {
+        let (code, _, err) = friction(&w, &["--import-labels", &write_labels(&w, text)]);
+        assert_eq!(code, 1, "{text}: {err}");
+        assert!(err.contains(names), "{text}: {err}");
+        assert_eq!(label_rows(&w), vec![], "{text}");
+    }
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn import_labels_refuses_malformed_json_and_an_oversized_file() {
+    let w = friction_world();
+    let (code, _, err) = friction(&w, &["--import-labels", &write_labels(&w, "{")]);
+    assert_eq!(code, 1);
+    assert!(err.contains("line 1"), "{err}");
+    let big = format!("{{{}", " ".repeat(8 << 20));
+    assert_eq!(big.len(), (8 << 20) + 1);
+    let (code, _, err) = friction(&w, &["--import-labels", &write_labels(&w, &big)]);
+    assert_eq!(code, 1);
+    assert!(err.contains("is over 8388608 bytes"), "{err}");
+    assert_eq!(label_rows(&w), vec![]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn label_pending_confirm_round_trip() {
+    let w = friction_world();
+    let (code, out, err) = friction(&w, &["--label", "aaaaaaaa:2", "borderline"]);
+    assert_eq!(code, 0, "{err}{out}");
+    let (_, out, _) = friction(&w, &["--pending"]);
+    assert_eq!(out.trim(), "aaaaaaaa:2  borderline  second prompt");
+    let (_, json, _) = friction(&w, &["--pending", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let first = &v["pending"][0];
+    assert_eq!((first["session_id"].as_str(), first["n"].as_i64()), (Some(FA), Some(2)), "{json}");
+    assert_eq!(label_rows(&w), vec![(FA.into(), 2, "borderline".into(), "retro".into(), 0)]);
+    let (code, _, err) = friction(&w, &["--confirm", "aaaaaaaa:2", "correction"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(label_rows(&w), vec![(FA.into(), 2, "correction".into(), "retro".into(), 1)]);
+    assert_eq!(friction(&w, &["--pending"]).1, "", "nothing is left to confirm");
+    // Confirming with no label keeps the one that is there.
+    friction(&w, &["--label", "aaaaaaaa:3", "borderline"]);
+    assert_eq!(friction(&w, &["--confirm", "aaaaaaaa:3"]).0, 0);
+    assert_eq!(label_rows(&w)[1], (FA.into(), 3, "borderline".into(), "retro".into(), 1));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn pending_lists_the_oldest_first() {
+    let w = friction_world();
+    let c = rusqlite_open(&w.db);
+    for (s, ts) in [(FB, "2026-11-12T10:00:00Z"), (FA, "2026-11-13T10:00:00Z"), ("zzzz", "2026-11-11T10:00:00Z")] {
+        c.execute("insert into labels (session_id, n, label, source, ts) values (?1, 1, 'borderline', 'retro', ?2)", [s, ts]).unwrap();
+    }
+    let (_, out, _) = friction(&w, &["--pending"]);
+    let refs: Vec<&str> = out.lines().filter_map(|l| l.split("  ").next()).collect();
+    assert_eq!(refs, vec!["zzzz:1", "bbbbbbbb:1", "aaaaaaaa:1"], "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn label_never_overwrites_a_confirmed_label() {
+    let w = friction_world();
+    let f = write_labels(&w, r#"{"aaaaaaaa:1":{"label":"correction"}}"#);
+    assert_eq!(friction(&w, &["--import-labels", &f]).0, 0);
+    let before = label_rows(&w);
+    let (code, out, err) = friction(&w, &["--label", "aaaaaaaa:1", "not_friction"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "kept the confirmed label correction for aaaaaaaa:1");
+    assert_eq!(label_rows(&w), before);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn label_refuses_an_ambiguous_or_unknown_ref() {
+    let w = friction_world();
+    write_session(&w, "aaaaaaaa-0000-0000-0000-000000000003", "2026-11-12T10:00:00.000Z", &[("another prompt", "r")]);
+    assert!(gopola(&w, &["index"]).0);
+    let (code, _, err) = friction(&w, &["--label", "aaaaaaaa:1", "borderline"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("2 sessions start with 'aaaaaaaa'; give more characters"), "{err}");
+    for r in ["zzzz:1", &format!("{FA}:x"), &format!("{FA}:0"), &format!("{FA}:4"), "bbbb%:1", "bbbbbbb_:1", "bbbbbbbb", ":1", &format!("{}:1", "a".repeat(65))] {
+        let (code, _, err) = friction(&w, &["--label", r, "borderline"]);
+        assert_eq!(code, 1, "{r}: {err}");
+        assert_eq!(label_rows(&w), vec![], "{r}");
+    }
+    let (code, _, err) = friction(&w, &["--label", &format!("{FA}:1"), "borderline"]);
+    assert_eq!(code, 0, "the full id resolves: {err}");
+    assert_eq!(label_rows(&w).len(), 1);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn label_refuses_a_label_outside_the_list() {
+    let w = friction_world();
+    let (code, _, err) = friction(&w, &["--label", "aaaaaaaa:1", "angry"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("angry"), "{err}");
+    assert_eq!(label_rows(&w), vec![]);
+    assert_eq!(friction(&w, &["--label", "aaaaaaaa:1", "borderline"]).0, 0);
+    let (code, _, err) = friction(&w, &["--confirm", "aaaaaaaa:1", "angry"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("angry"), "{err}");
+    assert_eq!(label_rows(&w), vec![(FA.into(), 1, "borderline".into(), "retro".into(), 0)], "the row is as it was");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn import_labels_refuses_two_keys_for_one_turn_with_different_labels() {
+    let w = friction_world();
+    // A prefix and the full id are two keys for one turn; the keys sort so that the full id comes first.
+    let both = |a: &str, b: &str| format!("{{\n  \"{FA}:1\": {{\"label\": \"{a}\"}},\n  \"aaaaaaaa:1\": {{\"label\": \"{b}\"}},\n  \"bbbbbbbb:1\": {{\"label\": \"borderline\"}}\n}}\n");
+    let (code, _, err) = friction(&w, &["--import-labels", &write_labels(&w, &both("correction", "borderline"))]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("\"aaaaaaaa:1\" on line 3") && err.contains(&format!("same turn as \"{FA}:1\"")), "{err}");
+    assert_eq!(label_rows(&w), vec![], "no row of the file is written");
+    // The same label under two keys says nothing twice: the turn is labelled once.
+    let (code, out, err) = friction(&w, &["--import-labels", &write_labels(&w, &both("correction", "correction"))]);
+    assert_eq!((code, out.trim()), (0, "imported 2 labels"), "{err}");
+    assert_eq!(label_rows(&w).len(), 2, "{:?}", label_rows(&w));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn the_labels_commands_print_json() {
+    let w = friction_world();
+    let json = |args: &[&str]| {
+        let (code, out, err) = friction(&w, args);
+        assert_eq!(code, 0, "{err}");
+        serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| panic!("{args:?}: {e}: {out}"))
+    };
+    let f = write_labels(&w, r#"{"aaaaaaaa:1":{"label":"correction"},"bbbbbbbb:1":{"label":"not_friction"}}"#);
+    assert_eq!(json(&["--import-labels", &f, "--json"]), serde_json::json!({"imported": 2}));
+    assert_eq!(json(&["--label", "aaaaaaaa:2", "borderline", "--json"]),
+        serde_json::json!({"ref": "aaaaaaaa:2", "session_id": FA, "n": 2, "label": "borderline", "confirmed": false}));
+    assert_eq!(json(&["--confirm", "aaaaaaaa:2", "--json"]),
+        serde_json::json!({"ref": "aaaaaaaa:2", "session_id": FA, "n": 2, "confirmed": true}));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn confirm_without_a_label_row_is_refused() {
+    let w = friction_world();
+    let (code, _, err) = friction(&w, &["--confirm", "bbbbbbbb:1"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("no label for bbbbbbbb:1: record one with --label first"), "{err}");
+    assert_eq!(label_rows(&w), vec![]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn index_full_keeps_scores_and_labels() {
+    let w = friction_world();
+    rusqlite_open(&w.db).execute(
+        "insert into scores (session_id, n, model, hash, score, ts) values (?1, 1, 'd3:4b-nvfp4', 'h', 0.5, '2026-11-17T00:00:00Z')", [FA]).unwrap();
+    assert_eq!(friction(&w, &["--import-labels", &write_labels(&w, r#"{"aaaaaaaa:1":{"label":"correction"}}"#)]).0, 0);
+    assert!(gopola(&w, &["index", "--full"]).0);
+    let c = rusqlite_open(&w.db);
+    assert_eq!(c.query_row("select count(*) from scores where session_id = ?1", [FA], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(label_rows(&w).len(), 1);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn pending_prints_control_characters_inert() {
+    let w = setup();
+    write_session(&w, FA, "2026-11-10T10:00:00.000Z", &[("\u{1b}[31mred\u{202e}", "r")]);
+    assert!(gopola(&w, &["index"]).0);
+    assert_eq!(friction(&w, &["--label", "aaaaaaaa:1", "borderline"]).0, 0);
+    let (code, out, err) = friction(&w, &["--pending"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(r"\u{1b}[31mred\u{202e}"), "{out:?}");
+    assert!(!out.contains('\u{1b}') && !out.contains('\u{202e}'), "{out:?}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn import_over_an_unconfirmed_label_confirms_it_with_the_files_label() {
+    let w = friction_world();
+    assert_eq!(friction(&w, &["--label", "aaaaaaaa:1", "borderline"]).0, 0);
+    let f = write_labels(&w, r#"{"aaaaaaaa:1":{"label":"correction"}}"#);
+    assert_eq!(friction(&w, &["--import-labels", &f]).0, 0);
+    assert_eq!(label_rows(&w), vec![(FA.into(), 1, "correction".into(), "import".into(), 1)]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_ref_prefix_is_one_to_sixty_four_characters() {
+    let w = setup();
+    let id = "c".repeat(70);
+    write_session(&w, &id, "2026-11-10T10:00:00.000Z", &[("only prompt", "r")]);
+    assert!(gopola(&w, &["index"]).0);
+    for r in [":1".to_string(), format!("{}:1", &id[..65])] {
+        let (code, _, err) = friction(&w, &["--label", &r, "borderline"]);
+        assert_eq!(code, 1, "{r}: {err}");
+        assert_eq!(label_rows(&w), vec![], "{r}");
+    }
+    let (code, _, err) = friction(&w, &["--label", &format!("{}:1", &id[..64]), "borderline"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(label_rows(&w).len(), 1);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+// ---- the scoring run: d3, the classifier, the pressure guard, the list ----
+
+const D3: &str = fake_ollama::DECISION_MODEL;
+
+/// Scripts that stand in for the Mac's memory-pressure source (`GOPOLA_SYSCTL`): no friction test reads the real
+/// one. `sysctl-1-then-4` prints 1 on its first two runs and 4 on every run after, counting in `sysctl-1-then-4.count`.
+fn pressure_scripts(w: &World) {
+    use std::os::unix::fs::PermissionsExt;
+    let counting = "n=$(cat \"$0.count\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$0.count\"; if [ $n -le 2 ]; then echo 1; else echo 4; fi";
+    for (name, body) in [("sysctl-1", "echo 1"), ("sysctl-4", "echo 4"), ("sysctl-garbage", "echo warm"), ("sysctl-1-then-4", counting)] {
+        let p = w.base.join(name);
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// `gopola friction` against `url`, with the pressure script `sysctl` (a file name in `w.base`).
+fn friction_cmd(w: &World, url: &str, sysctl: &str, args: &[&str]) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_gopola"));
+    c.env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects)
+        .env("GOPOLA_OLLAMA", url).env("GOPOLA_EMBED_MODEL", MODEL).env("GOPOLA_SYSCTL", w.base.join(sysctl))
+        .env("CLAUDE_CONFIG_DIR", w.base.join("claude")).env("COPILOT_HOME", w.base.join("copilot")).env("CODEX_HOME", w.base.join("codex"))
+        .current_dir(&w.repo).arg("friction").args(args);
+    c
+}
+
+fn friction_at(w: &World, url: &str, sysctl: &str, args: &[&str]) -> (i32, String, String) {
+    let out = friction_cmd(w, url, sysctl, args).output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into())
+}
+
+/// Session `FA`, indexed, with the pressure scripts. Its turns, eligible for scoring: 1 "add a search box", 2 a
+/// correction, 5 "thanks", 7 a prompt of 1,999 characters, 8 one of 3,900 bytes. Not eligible: 3 a command tag,
+/// 4 2,000 characters, 6 a continued-session note, 9 3,903 bytes (1,301 characters).
+fn score_world() -> World {
+    let w = setup();
+    let turns = [
+        "add a search box".to_string(), "that is wrong, I told you to run the tests".into(),
+        "<command-name>/clear</command-name>".into(), "y".repeat(2000), "thanks".into(),
+        "This session is being continued from a previous conversation.".into(), "x".repeat(1999),
+        "€".repeat(1300), "€".repeat(1301),
+    ];
+    let pairs: Vec<(&str, &str)> = turns.iter().map(|t| (t.as_str(), "r")).collect();
+    write_session(&w, FA, "2026-11-10T10:00:00.000Z", &pairs);
+    pressure_scripts(&w);
+    assert!(gopola(&w, &["index"]).0);
+    w
+}
+
+/// Every friction outcome row, oldest first: (cmd, arg, hits).
+fn outcome_rows(w: &World) -> Vec<(String, String, i64)> {
+    let c = rusqlite_open(&w.db);
+    let mut st = c.prepare("select cmd, arg, hits from usage where cmd like 'friction-%' order by rowid").unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+}
+
+/// d3's rows in `scores`: (turn, score, error).
+fn score_rows(w: &World) -> Vec<(i64, Option<f64>, Option<String>)> {
+    let c = rusqlite_open(&w.db);
+    let mut st = c.prepare("select n, score, error from scores where model = ?1 order by n").unwrap();
+    st.query_map([D3], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().flatten().collect()
+}
+
+fn calls(f: &FakeOllama) -> usize {
+    f.systemone.lock().unwrap().len()
+}
+
+fn unloads(f: &FakeOllama) -> usize {
+    f.unloads.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn session_scores_only_filtered_typed_prompts() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 0, "{err}");
+    let mut states: Vec<String> = fake.systemone.lock().unwrap().iter().map(|b| b["state"].as_str().unwrap().to_string()).collect();
+    states.sort();
+    let mut want = vec!["add a search box".to_string(), "that is wrong, I told you to run the tests".into(), "thanks".into(), "x".repeat(1999), "€".repeat(1300)];
+    want.sort();
+    assert_eq!(states, want);
+    // The request is the one that was measured: the model, the question, keep_alive and the window, whatever the prompt.
+    let sent = fake.systemone.lock().unwrap()[0].clone();
+    let mut measured = fixture("systemone-noul")["request"].clone();
+    measured["state"] = sent["state"].clone();
+    assert_eq!(sent, measured);
+    assert_eq!(score_rows(&w).iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2, 5, 7, 8]);
+    assert_eq!(outcome_rows(&w), vec![("friction-scored".to_string(), format!("{FA}: 5 scored, 0 rejected by d3"), 5)], "a prefix that names one session is recorded as its whole id");
+    assert!(out.lines().next().unwrap().contains("aaaaaaaa:2"), "{out}");
+    assert!(out.ends_with("classifier: off (no confirmed labels of both kinds; d3 alone)\n"), "{out}");
+    // The classifier's vectors for the same prompts: one batch, under the classification prefix and model key.
+    assert_eq!(*fake.batches.lock().unwrap(), vec![5]);
+    assert!(fake.bodies.lock().unwrap()[0]["input"][0].as_str().unwrap().starts_with("task: classification | query: "));
+    let v: i64 = rusqlite_open(&w.db).query_row("select count(*) from vectors where model = ?1", [format!("{MODEL}+classification")], |r| r.get(0)).unwrap();
+    assert_eq!(v, 5);
+    // -n cuts the list.
+    let (_, out, _) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa", "-n", "2"]);
+    assert_eq!(out.lines().count(), 3, "two prompts and the classifier line: {out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn scripted_sessions_are_not_scored() {
+    let w = score_world();
+    rusqlite_open(&w.db).execute("update sessions set scripted = 1", []).unwrap();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(calls(&fake), 0);
+    assert_eq!(outcome_rows(&w)[0].2, 0);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn rescoring_an_unchanged_session_calls_d3_zero_times() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--since", "2026-11-01", "--project", "all"]).0, 0);
+    assert_eq!(calls(&fake), 5, "the second run, a window over the same session, scored nothing again");
+    assert_eq!(fake.batches.lock().unwrap().len(), 1, "and embedded nothing again");
+    let rows = outcome_rows(&w);
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[1].0.as_str(), rows[1].2), ("friction-scored", 0));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_changed_prompt_is_scored_again() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    let hash = |n: i64| -> String {
+        rusqlite_open(&w.db).query_row("select hash from scores where session_id = ?1 and n = ?2", rusqlite::params![FA, n], |r| r.get(0)).unwrap()
+    };
+    let before = (hash(1), hash(2));
+    rusqlite_open(&w.db).execute("update turns set prompt = 'you guessed wrong' where n = 1", []).unwrap();
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    assert_eq!(calls(&fake), 6, "only the changed prompt went to d3 again");
+    assert_ne!(hash(1), before.0);
+    assert_eq!(hash(2), before.1);
+    assert_eq!(score_rows(&w).len(), 5, "its row was replaced, not added to");
+    assert_eq!(*fake.batches.lock().unwrap(), vec![5, 1], "and its classification vector was made again");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn pressure_four_defers_before_any_model_call() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-4", &["--session", "aaaaaaaa"]);
+    assert_eq!((code, out.as_str()), (1, "classifier: off (no confirmed labels of both kinds; d3 alone)\n"), "{err}");
+    assert!(err.contains("friction deferred: memory pressure is critical (level 4)"), "{err}");
+    assert_eq!((calls(&fake), fake.requests.load(std::sync::atomic::Ordering::SeqCst)), (0, 0));
+    assert_eq!(outcome_rows(&w), vec![("friction-deferred".to_string(), format!("{FA}: memory pressure is critical (level 4)"), 0)]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn pressure_four_mid_run_stops_unloads_and_keeps_scores() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1-then-4", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("friction deferred: memory pressure is critical (level 4)"), "{err}");
+    assert_eq!(calls(&fake), 1, "one call, then the level read 4 before the next");
+    assert_eq!(unloads(&fake), 1);
+    assert_eq!(score_rows(&w).len(), 1, "what was scored is kept");
+    assert_eq!(fake.requests.load(std::sync::atomic::Ordering::SeqCst), 0, "and nothing is embedded after the stop");
+    let rows = outcome_rows(&w);
+    assert_eq!((rows[0].0.as_str(), rows[0].2), ("friction-deferred", 1));
+    // The level is read before the run's first call and before each d3 call: 1, 1, then the 4 that stopped it.
+    assert_eq!(fs::read_to_string(w.base.join("sysctl-1-then-4.count")).unwrap().trim(), "3");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn pressure_four_before_any_call_sends_no_unload() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-4", &["--session", "aaaaaaaa"]).0, 1);
+    assert_eq!(unloads(&fake), 0, "an unload would load d3 first");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn the_unloads_answer_never_changes_deferred() {
+    let w = score_world();
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::UnloadFails);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1-then-4", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("friction deferred: memory pressure is critical"), "{err}");
+    assert_eq!(unloads(&fake), 1, "the unload was sent, and answered 500");
+    assert_eq!(outcome_rows(&w)[0].0, "friction-deferred");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// A listener that counts the connections made to it, and answers each: where a followed redirect would lead.
+fn tripwire() -> (&'static str, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let location: &'static str = Box::leak(format!("http://{}/", listener.local_addr().unwrap()).into_boxed_str());
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    std::thread::spawn(move || for mut stream in listener.incoming().flatten() {
+        seen.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+    });
+    (location, hits)
+}
+
+/// A friction run (`sysctl` is its pressure script) against a fake that answers `POST route` with `status` and a
+/// `Location` at a tripwire: its exit code, stderr and outcome kind, and the connections that the tripwire saw. A 307
+/// alone would not prove that nothing follows: ureq refuses to re-send a POST body on a 307 even when told to follow,
+/// and only follows a 302 (as a GET).
+fn friction_redirected(route: &'static str, status: &'static str, sysctl: &str) -> (i32, String, String, usize) {
+    let w = score_world();
+    let (location, hits) = tripwire();
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::Redirect { route, status, location });
+    let (code, _, err) = friction_at(&w, &fake.url, sysctl, &["--session", "aaaaaaaa"]);
+    let kind = outcome_rows(&w)[0].0.clone();
+    if sysctl == "sysctl-1-then-4" {
+        assert_eq!(fs::read_to_string(w.base.join("sysctl-1-then-4.count")).unwrap().trim(), "3", "the run reached the unload: {err}");
+    }
+    fs::remove_dir_all(&w.base).unwrap();
+    (code, err, kind, hits.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[test]
+fn friction_d3_call_follows_no_redirect() {
+    for status in ["302 Found", "307 Temporary Redirect"] {
+        let (code, err, kind, followed) = friction_redirected("/v1/systemone", status, "sysctl-1");
+        assert_eq!(followed, 0, "{status}: a redirect was followed");
+        assert_eq!((code, kind.as_str()), (1, "friction-failed"), "{status}: {err}");
+        assert!(err.contains(&format!("status {}", &status[..3])), "{status}: {err}");
+    }
+}
+
+#[test]
+fn friction_unload_follows_no_redirect() {
+    // The unload that follows a d3 call when the pressure turns critical.
+    for status in ["302 Found", "307 Temporary Redirect"] {
+        let (code, err, kind, followed) = friction_redirected("/api/generate", status, "sysctl-1-then-4");
+        assert_eq!(followed, 0, "{status}: a redirect was followed");
+        assert_eq!((code, kind.as_str()), (1, "friction-deferred"), "{status}: {err}");
+    }
+}
+
+#[test]
+fn friction_ignores_proxy_variables() {
+    // gopola sends turn text to GOPOLA_OLLAMA only. With every proxy variable at a closed port, a run that honoured them
+    // could not reach the fake: the d3 calls and the classification embed, or the d3 call and the unload.
+    for (sysctl, d3_calls, embeds, unload_calls) in [("sysctl-1", 5, 1, 0), ("sysctl-1-then-4", 1, 0, 1)] {
+        let w = score_world();
+        let fake = FakeOllama::start(8, MODEL);
+        let mut cmd = friction_cmd(&w, &fake.url, sysctl, &["--session", "aaaaaaaa"]);
+        set_proxy(&mut cmd, NO_OLLAMA);
+        let (code, _, err) = gopola_run(&mut cmd);
+        assert_eq!(code, i32::from(unload_calls == 1), "{sysctl}: {err}");
+        assert_eq!((calls(&fake), fake.requests.load(std::sync::atomic::Ordering::SeqCst), unloads(&fake)), (d3_calls, embeds, unload_calls), "{sysctl}: {err}");
+        fs::remove_dir_all(&w.base).unwrap();
+    }
+}
+
+#[test]
+fn unreadable_pressure_defers() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    for script in ["sysctl-garbage", "no-such-script"] {
+        let (code, _, err) = friction_at(&w, &fake.url, script, &["--session", "aaaaaaaa"]);
+        assert_eq!(code, 1, "{script}: {err}");
+        assert!(err.contains("friction deferred: memory pressure unreadable"), "{script}: {err}");
+    }
+    assert_eq!(calls(&fake), 0);
+    let rows = outcome_rows(&w);
+    assert_eq!(rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["friction-deferred", "friction-deferred"]);
+    assert_eq!(rows[0].1, format!("{FA}: memory pressure unreadable"));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn d3_not_pulled_is_a_failed_run_that_names_the_pull() {
+    let w = score_world();
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::NoDecisionModel);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("ollama pull d3:4b-nvfp4"), "{err}");
+    let rows = outcome_rows(&w);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "friction-failed");
+    assert!(rows[0].1.contains("ollama pull d3:4b-nvfp4"), "{rows:?}");
+    assert_eq!(score_rows(&w), vec![], "a run-level error marks nothing");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_rejected_prompt_is_marked_and_the_run_goes_on() {
+    let w = score_world();
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::RejectState("add a search"));
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(calls(&fake), 5, "the refused prompt did not stop the run");
+    let rows = score_rows(&w);
+    assert_eq!(rows.iter().filter(|r| r.1.is_some() && r.2.is_none()).count(), 4);
+    let marked: Vec<_> = rows.iter().filter(|r| r.1.is_none()).collect();
+    assert_eq!(marked.len(), 1);
+    assert_eq!(marked[0].0, 1);
+    assert!(marked[0].2.as_deref().unwrap().contains("status 400: rejected"), "{marked:?}");
+    assert_eq!(outcome_rows(&w)[0].1, format!("{FA}: 4 scored, 1 rejected by d3"));
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    assert_eq!(calls(&fake), 5, "a marked prompt is not asked again until its text changes");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_server_error_stops_the_run_without_markers() {
+    let w = score_world();
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::Status500);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("friction failed: ollama answered unexpectedly"), "{err}");
+    assert_eq!(calls(&fake), 1, "the first 500 ended the run");
+    assert_eq!(score_rows(&w), vec![]);
+    let rows = outcome_rows(&w);
+    assert_eq!((rows.len(), rows[0].0.as_str()), (1, "friction-failed"));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_second_run_while_one_holds_the_lock_defers() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let lock = fs::OpenOptions::new().create(true).write(true).truncate(false).open(format!("{}.friction.lock", w.db.display())).unwrap();
+    lock.try_lock().unwrap();
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("friction deferred: another friction run is in progress"), "{err}");
+    assert_eq!(calls(&fake), 0);
+    assert_eq!(outcome_rows(&w), vec![("friction-deferred".to_string(), format!("{FA}: another friction run is in progress"), 0)]);
+    drop(lock);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    assert_eq!(calls(&fake), 5);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn an_unknown_session_still_writes_an_outcome_row() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "ffffffff"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("friction failed: no such session"), "{err}");
+    assert_eq!(outcome_rows(&w), vec![("friction-failed".to_string(), "ffffffff: no such session".to_string(), 0)]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_prefix_that_names_two_sessions_is_refused() {
+    let w = score_world();
+    write_session(&w, "aaaaaaaa-0000-0000-0000-000000000003", "2026-11-10T10:00:00.000Z", &[("another", "r")]);
+    assert!(gopola(&w, &["index"]).0);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("2 sessions start with 'aaaaaaaa'"), "{err}");
+    // A % or _ in the prefix is text, not a wildcard.
+    let (_, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "a%"]);
+    assert!(err.contains("no such session"), "{err}");
+    assert_eq!(calls(&fake), 0);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_run_updates_only_its_own_outcome_row() {
+    let w = score_world();
+    rusqlite_open(&w.db).execute(
+        "insert into usage (ts, cmd, arg, hits) values ('2026-11-17T00:00:00Z', 'friction-failed', ?1, 0)", [format!("{FA}: did not finish")]).unwrap();
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    let rows = outcome_rows(&w);
+    assert_eq!(rows[0], ("friction-failed".to_string(), format!("{FA}: did not finish"), 0), "a killed run's row is left as it was");
+    assert_eq!((rows.len(), rows[1].0.as_str(), rows[1].2), (2, "friction-scored", 5));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_killed_run_leaves_a_did_not_finish_row() {
+    let w = score_world();
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::DelayMs(30_000));
+    let mut child = friction_cmd(&w, &fake.url, "sysctl-1", &["--session", FA]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let start = std::time::Instant::now();
+    while outcome_rows(&w).is_empty() && start.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    while calls(&fake) == 0 && start.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(outcome_rows(&w), vec![("friction-failed".to_string(), format!("{FA}: did not finish"), 0)]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_window_scores_by_date_and_project() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--since", "2026-11-11"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &["--since", "2026-11-01", "--project", "no-such-project"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(calls(&fake), 0, "after the window, and in another project");
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-1", &["--since", "2026-11-01"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(calls(&fake), 5);
+    assert!(out.lines().next().unwrap().contains("demo-app"), "{out}");
+    let args: Vec<String> = outcome_rows(&w).into_iter().map(|r| r.1).collect();
+    assert_eq!(args[0], "since 2026-11-11 demo-app: 0 scored, 0 rejected by d3");
+    assert!(args[2].starts_with("since 2026-11-01 demo-app: 5 scored"), "{args:?}");
+    let (code, _, err) = friction_at(&w, &fake.url, "sysctl-1", &[]);
+    assert_eq!(code, 1);
+    assert!(err.contains("friction needs --session <prefix> or --since <date>"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_window_lists_only_prompts_inside_it_from_a_session_that_crosses_its_start() {
+    let w = setup();
+    pressure_scripts(&w);
+    let cwd = w.repo.to_string_lossy().to_string();
+    let lines = [prompt("2026-11-01T10:00:00.000Z", "wrong, early on", &cwd), reply("2026-11-01T10:00:05.000Z", "r", None),
+        prompt("2026-11-12T10:00:00.000Z", "wrong again, late", &cwd), reply("2026-11-12T10:00:05.000Z", "r", None)];
+    fs::write(transcript_dir(&w).join(format!("{FA}.jsonl")), lines.join("\n") + "\n").unwrap();
+    assert!(gopola(&w, &["index"]).0);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-1", &["--since", "2026-11-10"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(calls(&fake), 2, "the session is scored whole");
+    let listed: Vec<&str> = out.lines().filter(|l| !l.starts_with("classifier:")).collect();
+    assert_eq!(listed.len(), 1, "{out}");
+    assert!(listed[0].contains("aaaaaaaa:2"), "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// Confirmed labels for `FA`'s turns, by import: `(ref, label)`.
+fn confirm_labels(w: &World, labels: &[(&str, &str)]) {
+    let body: serde_json::Map<String, serde_json::Value> = labels.iter().map(|(r, l)| (r.to_string(), serde_json::json!({"label": l}))).collect();
+    assert_eq!(friction(w, &["--import-labels", &write_labels(w, &serde_json::Value::Object(body).to_string())]).0, 0);
+}
+
+fn listing(w: &World, url: &str, args: &[&str]) -> serde_json::Value {
+    let mut a = vec!["--session", "aaaaaaaa", "--json"];
+    a.extend_from_slice(args);
+    let (code, out, err) = friction_at(w, url, "sysctl-1", &a);
+    assert_eq!(code, 0, "{err}");
+    serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))
+}
+
+#[test]
+fn classifier_joins_once_both_labels_are_confirmed() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let v = listing(&w, &fake.url, &[]);
+    assert_eq!((v["outcome"].as_str(), v["scored"].as_u64(), v["classifier_labels"].as_u64()), (Some("scored"), Some(5), Some(0)));
+    assert!(v["prompts"].as_array().unwrap().iter().all(|p| p["classifier"].is_null()));
+    confirm_labels(&w, &[("aaaaaaaa:2", "correction"), ("aaaaaaaa:1", "not_friction")]);
+    let v = listing(&w, &fake.url, &[]);
+    assert_eq!(v["classifier_labels"], 2);
+    let clf = |n: i64| v["prompts"].as_array().unwrap().iter().find(|p| p["n"] == n).unwrap()["classifier"].as_f64().unwrap();
+    assert!(clf(2) > 0.5 && clf(1) < 0.5, "trained on a correction (turn 2) and a not_friction (turn 1): {} {}", clf(2), clf(1));
+    let (_, out, _) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert!(out.ends_with("classifier: trained on 2 confirmed labels\n"), "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn only_a_correction_is_a_positive_and_a_missing_class_keeps_the_classifier_off() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    // borderline is a negative, so these labels are all negatives
+    confirm_labels(&w, &[("aaaaaaaa:2", "borderline"), ("aaaaaaaa:1", "not_friction")]);
+    assert_eq!(listing(&w, &fake.url, &[])["classifier_labels"], 0);
+    // and two corrections are all positives
+    confirm_labels(&w, &[("aaaaaaaa:2", "correction"), ("aaaaaaaa:1", "correction")]);
+    assert_eq!(listing(&w, &fake.url, &[])["classifier_labels"], 0);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn unconfirmed_retro_labels_do_not_train() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction(&w, &["--label", "aaaaaaaa:2", "correction"]).0, 0);
+    assert_eq!(friction(&w, &["--label", "aaaaaaaa:1", "not_friction"]).0, 0);
+    let (_, out, _) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert!(out.ends_with("classifier: off (no confirmed labels of both kinds; d3 alone)\n"), "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_label_shows_on_its_line_as_confirmed_or_not() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    confirm_labels(&w, &[("aaaaaaaa:2", "correction")]);
+    assert_eq!(friction(&w, &["--label", "aaaaaaaa:1", "borderline"]).0, 0);
+    let (_, out, _) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    let line = |r: &str| out.lines().find(|l| l.contains(r)).unwrap().to_string();
+    assert!(line("aaaaaaaa:2").ends_with("[correction ✓]"), "{out}");
+    assert!(line("aaaaaaaa:1").ends_with("[borderline ?]"), "{out}");
+    assert!(!line("aaaaaaaa:5").contains('['), "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_prompts_rank_is_over_every_scored_prompt_not_the_window() {
+    let w = score_world();
+    write_session(&w, FB, "2026-11-11T10:00:00.000Z", &[("add a dark mode toggle", "r")]);
+    assert!(gopola(&w, &["index"]).0);
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "bbbbbbbb", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let rank = v["prompts"][0]["rank"].as_f64().unwrap();
+    // six scored prompts, five of them at d3 0.1 (positions 0 to 4, mean 2): rank 2/6. Over its own window alone it would be 0.
+    assert!((rank - 2.0 / 6.0).abs() < 1e-9, "{rank}");
+    assert_eq!(v["prompts"].as_array().unwrap().len(), 1);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn listing_prints_prompt_text_inert() {
+    let w = setup();
+    write_session(&w, FA, "2026-11-10T10:00:00.000Z", &[("\u{1b}[31mwrong\u{202e} again", "r")]);
+    pressure_scripts(&w);
+    assert!(gopola(&w, &["index"]).0);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(r"\u{1b}[31mwrong\u{202e} again"), "{out:?}");
+    assert!(!out.contains('\u{1b}') && !out.contains('\u{202e}'), "{out:?}");
+    let v = listing(&w, &fake.url, &[]);
+    assert_eq!(v["prompts"][0]["prompt"], "\u{1b}[31mwrong\u{202e} again");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn quiet_prints_nothing_and_exits_zero() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-4", &["--session", "aaaaaaaa", "--quiet"]);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(outcome_rows(&w)[0].0, "friction-deferred");
+    let (code, out, err) = friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa", "--quiet"]);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(calls(&fake), 5, "--quiet still scores");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn without_a_pressure_source_the_run_is_skipped() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    let mut c = friction_cmd(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]);
+    let out = c.env_remove("GOPOLA_SYSCTL").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(calls(&fake), 0);
+    assert_eq!(outcome_rows(&w), vec![("friction-skipped".to_string(), format!("{FA}: friction scoring runs on macOS only"), 0)]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+// ---- the SessionEnd hook's detached run, its catch-up, and doctor's friction line ----
+
+/// `gopola friction --auto` with `stdin` as the hook's JSON, as its own process group's leader (so that a test can
+/// ask whether the detached run left that group). The run that it starts is not waited for: a test polls the database.
+/// The exit code, stdout and stderr, and the process id.
+fn friction_auto(w: &World, url: &str, sysctl: &str, stdin: &str) -> (i32, String, String, u32) {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut child = friction_cmd(w, url, sysctl, &["--auto"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .process_group(0).spawn().unwrap();
+    let pid = child.id();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    // Waits for the pipes to close: a detached run that kept them would hold this call until it ended.
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into(), pid)
+}
+
+/// Polls for up to 20 s: the detached run takes a few seconds, and more under load.
+fn wait_for(what: &str, ready: impl Fn() -> bool) {
+    let start = std::time::Instant::now();
+    while !ready() {
+        assert!(start.elapsed().as_secs() < 20, "gave up waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The friction outcome rows after a moment: a run that a refused hook input wrongly started would have written its by then.
+fn rows_after_a_moment(w: &World) -> Vec<(String, String, i64)> {
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    outcome_rows(w)
+}
+
+/// Each session's latest friction outcome: the text before the first `:` of its row, and its cmd.
+fn latest_outcomes(w: &World) -> std::collections::BTreeMap<String, String> {
+    outcome_rows(w).into_iter().map(|(cmd, arg, _)| (arg.split(':').next().unwrap().to_string(), cmd)).collect()
+}
+
+fn sid(i: u32) -> String {
+    format!("1000000{i}-0000-0000-0000-00000000000{i}")
+}
+
+/// `FA` and `FB` (see `friction_world`) and sessions `sid(1)` to `sid(k)`, each with one eligible prompt; the pressure scripts.
+fn stalled_world(k: u32) -> World {
+    let w = friction_world();
+    pressure_scripts(&w);
+    for i in 1..=k {
+        write_session(&w, &sid(i), "2026-11-10T10:00:00.000Z", &[("that is wrong again", "r")]);
+    }
+    assert!(gopola(&w, &["index"]).0);
+    w
+}
+
+/// A friction outcome row from `ago` ago (a SQLite modifier such as '-2 hours').
+fn outcome_at(w: &World, ago: &str, cmd: &str, arg: &str) {
+    rusqlite_open(&w.db).execute(
+        "insert into usage (ts, cmd, arg, hits) values (strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?1), ?2, ?3, 0)", rusqlite::params![ago, cmd, arg]).unwrap();
+}
+
+#[test]
+fn auto_returns_at_once_and_the_detached_run_scores() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    // d3 and the embedding take 4 s between them, so a command that waited for them would take over 4 s.
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::DelayMs(1000));
+    let t = std::time::Instant::now();
+    let (code, out, err, _) = friction_auto(&w, &fake.url, "sysctl-1", &format!(r#"{{"session_id":"{FA}"}}"#));
+    assert!(t.elapsed().as_millis() < 2000, "returned after {:?}", t.elapsed());
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    wait_for("the scored row", || outcome_rows(&w).iter().any(|r| r.0 == "friction-scored"));
+    assert_eq!(outcome_rows(&w), vec![("friction-scored".to_string(), format!("{FA}: 3 scored, 0 rejected by d3"), 3)]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn the_detached_run_leaves_the_hooks_process_group() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::DelayMs(1000));
+    let (code, _, _, pid) = friction_auto(&w, &fake.url, "sysctl-1", &format!(r#"{{"session_id":"{FA}"}}"#));
+    assert_eq!(code, 0);
+    // `kill -0` on a group succeeds while any process is in it. The hook is gone, and the run (4 s long) is not in its group.
+    let in_group = Command::new("sh").args(["-c", "kill -0 -- -$0 2>/dev/null", &pid.to_string()]).status().unwrap().success();
+    assert!(!in_group, "a killed hook would take the run with it");
+    wait_for("the scored row", || outcome_rows(&w).iter().any(|r| r.0 == "friction-scored"));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn auto_refuses_a_hostile_session_id() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let (long, over) = ("a".repeat(100), "a".repeat(65));
+    let ids = ["--json; rm -rf /", "../x", over.as_str(), "", "x\u{1b}[31m", long.as_str()];
+    for id in ids {
+        let (code, out, err, _) = friction_auto(&w, &fake.url, "sysctl-1", &serde_json::json!({"session_id": id}).to_string());
+        assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""), "{id:?}");
+    }
+    let rows = rows_after_a_moment(&w);
+    assert!(rows.iter().all(|r| r.0 == "friction-failed" && r.1.starts_with("invalid session id ")), "one refusal row each, no run: {rows:?}");
+    assert_eq!(rows.len(), ids.len(), "{rows:?}");
+    assert_eq!(rows[0].1, "invalid session id --json; rm -rf /");
+    assert_eq!(rows[4].1, r"invalid session id x\u{1b}[31m", "printable");
+    assert_eq!(rows[5].1, format!("invalid session id {}…", "a".repeat(80)), "clipped to 80 characters");
+    assert_eq!(calls(&fake), 0);
+    // A refusal is not a session to catch up: the next run writes its own row and no other.
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    assert_eq!(outcome_rows(&w).len(), ids.len() + 1);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn auto_with_no_json_exits_zero_quietly() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    for input in ["not json", "", r#"{"session_id":7}"#, "{}"] {
+        let (code, out, err, _) = friction_auto(&w, &fake.url, "sysctl-1", input);
+        assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""), "{input:?}");
+    }
+    let rows = rows_after_a_moment(&w);
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert!(rows.iter().all(|r| r.0 == "friction-failed" && r.1 == "the hook sent no session_id"), "{rows:?}");
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    assert_eq!(outcome_rows(&w).len(), 5, "and the next run leaves them alone");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn auto_exits_zero_when_it_cannot_run_at_all() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    // A database that cannot be opened (a folder), and another form beside --auto: an error, and still exit 0.
+    for (db, extra) in [(w.base.clone(), None), (w.db.clone(), Some(["--session", FA]))] {
+        let mut args = vec!["--auto"];
+        args.extend(extra.into_iter().flatten());
+        let out = friction_cmd(&w, NO_OLLAMA, "sysctl-1", &args).env("GOPOLA_DB", db).stdin(std::process::Stdio::null()).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stderr).starts_with("gopola: "), "the error is still said");
+    }
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn auto_for_a_session_not_indexed_yet_writes_an_outcome_row() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let missing = "cccccccc-0000-0000-0000-000000000003";
+    let (code, _, _, _) = friction_auto(&w, &fake.url, "sysctl-1", &format!(r#"{{"session_id":"{missing}"}}"#));
+    assert_eq!(code, 0);
+    wait_for("the run's outcome", || outcome_rows(&w).iter().any(|r| r.1.ends_with("no such session")));
+    assert_eq!(outcome_rows(&w), vec![("friction-failed".to_string(), format!("{missing}: no such session"), 0)]);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn the_next_detached_run_scores_a_deferred_session() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-4", &["--session", FA, "--quiet"]).0, 0);
+    assert_eq!(outcome_rows(&w)[0].0, "friction-deferred");
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    let order: Vec<(String, String)> = outcome_rows(&w).into_iter().map(|(cmd, arg, _)| (cmd, arg.split(':').next().unwrap().to_string())).collect();
+    assert_eq!(order, vec![("friction-deferred".to_string(), FA.to_string()), ("friction-scored".into(), FB.into()), ("friction-scored".into(), FA.into())]);
+    let scored: i64 = rusqlite_open(&w.db).query_row("select count(*) from scores where session_id = ?1", [FA], |r| r.get(0)).unwrap();
+    assert_eq!(scored, 3, "the deferred session's prompts were scored by the next run");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn catch_up_takes_at_most_five_sessions() {
+    let w = stalled_world(6);
+    let fake = FakeOllama::start(8, MODEL);
+    for i in 1..=6 {
+        assert_eq!(friction_at(&w, &fake.url, "sysctl-4", &["--session", &sid(i), "--quiet"]).0, 0);
+    }
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    let latest = latest_outcomes(&w);
+    let scored: Vec<u32> = (1..=6).filter(|i| latest[&sid(*i)] == "friction-scored").collect();
+    assert_eq!(scored, vec![2, 3, 4, 5, 6], "newest first, five of them");
+    assert_eq!(latest[&sid(1)], "friction-deferred");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_deferral_stops_the_catch_up() {
+    let w = stalled_world(2);
+    let fake = FakeOllama::start(8, MODEL);
+    for i in 1..=2 {
+        assert_eq!(friction_at(&w, &fake.url, "sysctl-4", &["--session", &sid(i), "--quiet"]).0, 0);
+    }
+    // FB's own run reads 1 and 1; the first catch-up run reads the 4.
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1-then-4", &["--session", FB, "--quiet"]).0, 0);
+    let order: Vec<(String, String)> = outcome_rows(&w).into_iter().map(|(cmd, arg, _)| (cmd, arg.split(':').next().unwrap().to_string())).collect();
+    assert_eq!(order[2..], [("friction-scored".to_string(), FB.to_string()), ("friction-deferred".into(), sid(2))], "{order:?}");
+    assert_eq!(order.len(), 4, "the second session was not tried after the deferral");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_run_whose_row_cannot_be_inserted_does_not_overwrite_the_previous_runs() {
+    let w = stalled_world(2);
+    let fake = FakeOllama::start(8, MODEL);
+    for i in 1..=2 {
+        assert_eq!(friction_at(&w, &fake.url, "sysctl-4", &["--session", &sid(i), "--quiet"]).0, 0);
+    }
+    // The second session's run cannot make its first row. On the connection that already ran FB, the last rowid is FB's.
+    rusqlite_open(&w.db).execute_batch(&format!(
+        "create trigger refuse_row before insert on usage when new.arg = '{}: did not finish' begin select raise(abort, 'refused'); end", sid(2))).unwrap();
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    let latest = latest_outcomes(&w);
+    assert_eq!((latest[FB].as_str(), latest[&sid(2)].as_str(), latest[&sid(1)].as_str()), ("friction-scored", "friction-scored", "friction-scored"), "{latest:?}");
+    assert_eq!(outcome_rows(&w).len(), 5, "the refused run's outcome is a row of its own");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_failed_own_run_is_not_retried_by_its_own_catch_up() {
+    let w = score_world();
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::NoDecisionModel);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa", "--quiet"]).0, 0);
+    assert_eq!(outcome_rows(&w).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["friction-failed"], "one row, not a second run of the same session");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn catch_up_leaves_out_what_is_old_done_or_not_a_session() {
+    let w = stalled_world(5);
+    let fake = FakeOllama::start(8, MODEL);
+    outcome_at(&w, "-8 days", "friction-deferred", &format!("{}: memory pressure is critical (level 4)", sid(1)));
+    outcome_at(&w, "-2 days", "friction-deferred", &format!("{}: memory pressure is critical (level 4)", sid(2)));
+    outcome_at(&w, "-1 days", "friction-scored", &format!("{}: 1 scored, 0 rejected by d3", sid(2)));
+    outcome_at(&w, "-1 days", "friction-failed", &format!("{}: no such session", sid(3)));
+    outcome_at(&w, "-10 minutes", "friction-failed", &format!("{}: did not finish", sid(4)));
+    outcome_at(&w, "-1 days", "friction-deferred", &format!("{}: memory pressure is critical (level 4)", sid(5)));
+    // Rows that name no session: a window, a refused hook input, a hook with no JSON.
+    outcome_at(&w, "-1 days", "friction-deferred", "since 2026-11-01 demo-app: memory pressure is critical (level 4)");
+    outcome_at(&w, "-1 days", "friction-failed", "invalid session id a: b");
+    outcome_at(&w, "-1 days", "friction-failed", "the hook sent no session_id");
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    let latest = latest_outcomes(&w);
+    let got: Vec<&str> = (1..=5).map(|i| latest[&sid(i)].as_str()).collect();
+    assert_eq!(got, ["friction-deferred", "friction-scored", "friction-failed", "friction-failed", "friction-scored"],
+        "only the session that was deferred a day ago was tried: not one from 8 days ago, one that a later run scored, \
+         one with no such session, one that is still running");
+    assert_eq!(outcome_rows(&w).len(), 9 + 2, "the trigger's row and the one catch-up: {:?}", outcome_rows(&w));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn the_next_detached_run_retries_a_killed_run() {
+    let w = friction_world();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    outcome_at(&w, "-2 hours", "friction-failed", &format!("{FA}: did not finish"));
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    assert_eq!(latest_outcomes(&w)[FA], "friction-scored");
+    assert!(outcome_rows(&w).iter().all(|r| !r.1.contains("no such session")), "{:?}", outcome_rows(&w));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_killed_run_by_prefix_is_retried_once() {
+    let w = stalled_world(2);
+    let fake = FakeOllama::start(8, MODEL);
+    outcome_at(&w, "-2 hours", "friction-failed", "10000001: did not finish");
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    assert_eq!(latest_outcomes(&w)[&sid(1)], "friction-scored", "the prefix named one session, and it was retried");
+    let rows = outcome_rows(&w).len();
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    assert_eq!(outcome_rows(&w).len(), rows + 1, "the next run writes its own row only: the prefix row is that session, scored since");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn an_ambiguous_prefix_keeps_its_text_and_is_not_retried() {
+    let w = stalled_world(2);
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "1000000", "--quiet"]).0, 0);
+    assert_eq!(outcome_rows(&w), vec![("friction-failed".to_string(), "1000000: 2 sessions start with '1000000'".to_string(), 0)]);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    let rows = outcome_rows(&w);
+    assert_eq!(rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["friction-failed", "friction-scored"], "no run for the prefix: {rows:?}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn a_catch_up_that_cannot_read_the_outcome_rows_says_so() {
+    let w = stalled_world(1);
+    let fake = FakeOllama::start(8, MODEL);
+    // A row whose text is a blob: reading it as text fails, and so does the catch-up's read of every row.
+    rusqlite_open(&w.db).execute("insert into usage (ts, cmd, arg, hits) values (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'friction-failed', X'ff00', 0)", []).unwrap();
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", FB, "--quiet"]).0, 0);
+    let said: Vec<(String, String)> = rusqlite_open(&w.db)
+        .prepare("select cmd, arg from usage where arg like 'catch-up could not read%'").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].0, "friction-failed");
+    assert!(said[0].1.starts_with("catch-up could not read the outcome rows: "), "{said:?}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// `gopola doctor` with a memory-pressure script, so that the friction line is the macOS one on any machine.
+fn doctor_at(w: &World, sysctl: &str) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_gopola"))
+        .env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects).env("GOPOLA_OLLAMA", NO_OLLAMA).env("GOPOLA_SYSCTL", w.base.join(sysctl))
+        .env("CLAUDE_CONFIG_DIR", w.base.join("claude")).env("COPILOT_HOME", w.base.join("copilot")).env("CODEX_HOME", w.base.join("codex"))
+        .current_dir(&w.repo).arg("doctor").output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into()
+}
+
+fn ended_two_hours_ago(w: &World) {
+    rusqlite_open(&w.db).execute("update sessions set ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2 hours')", []).unwrap();
+}
+
+#[test]
+fn doctor_shows_a_deferred_run() {
+    let w = score_world();
+    let fake = FakeOllama::start(8, MODEL);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-4", &["--session", "aaaaaaaa", "--quiet"]).0, 0);
+    ended_two_hours_ago(&w);
+    let out = doctor_at(&w, "sysctl-1");
+    assert!(out.contains("look  friction: 1 session(s) in 30 days have unscored prompts (1 deferred and 0 failed runs; latest: "), "{out}");
+    assert!(out.contains(&format!("{FA}: memory pressure is critical (level 4)): gopola friction --since 2026-11-10 --project all scores them \
+        (about 0.43 s a prompt with d3 held, so 5 prompts take about 0.1 min)")), "{out}");
+    // A session that has not ended yet is the SessionEnd hook's to score.
+    rusqlite_open(&w.db).execute("update sessions set ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes')", []).unwrap();
+    assert!(doctor_at(&w, "sysctl-1").contains("ok    friction: every ended session in 30 days scored (1 deferred and 0 failed runs, since caught up)"));
+    ended_two_hours_ago(&w);
+    assert_eq!(friction_at(&w, &fake.url, "sysctl-1", &["--session", "aaaaaaaa"]).0, 0);
+    let out = doctor_at(&w, "sysctl-1");
+    assert!(out.contains("ok    friction: every ended session in 30 days scored (1 deferred and 0 failed runs, since caught up)"), "{out}");
+    // A prompt whose text changed since it was scored is unscored again.
+    rusqlite_open(&w.db).execute("update turns set prompt = 'you guessed wrong' where n = 1", []).unwrap();
+    let out = doctor_at(&w, "sysctl-1");
+    assert!(out.contains("1 session(s) in 30 days have unscored prompts") && out.contains("so 1 prompts take about 0.1 min)"), "{out}");
+    // And a session older than 30 days is left to `friction --since`.
+    rusqlite_open(&w.db).execute("update sessions set ended_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-31 days')", []).unwrap();
+    assert!(doctor_at(&w, "sysctl-1").contains("ok    friction: every ended session"));
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn doctor_does_not_count_a_run_in_progress() {
+    let w = score_world();
+    outcome_at(&w, "-5 minutes", "friction-failed", &format!("{FA}: did not finish"));
+    ended_two_hours_ago(&w);
+    let out = doctor_at(&w, "sysctl-1");
+    assert!(out.contains("look  friction: 1 session(s) in 30 days have unscored prompts (0 deferred and 0 failed runs)"), "a run in progress: {out}");
+    outcome_at(&w, "-2 hours", "friction-failed", &format!("{FA}: did not finish"));
+    let out = doctor_at(&w, "sysctl-1");
+    assert!(out.contains("(0 deferred and 1 failed runs; latest: "), "a killed run is a failed one: {out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+/// `gopola eval friction --dir <dir>` against `url`, with the pressure script `sysctl`; the caller may add env before it runs.
+fn eval_friction_cmd(w: &World, url: &str, sysctl: &str, dir: &Path, extra: &[&str]) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_gopola"));
+    c.env("GOPOLA_DB", &w.db).env("GOPOLA_PROJECTS", &w.projects)
+        .env("GOPOLA_OLLAMA", url).env("GOPOLA_EMBED_MODEL", MODEL).env("GOPOLA_SYSCTL", w.base.join(sysctl))
+        .env("CLAUDE_CONFIG_DIR", w.base.join("claude")).env("COPILOT_HOME", w.base.join("copilot")).env("CODEX_HOME", w.base.join("codex"))
+        .current_dir(&w.repo).args(["eval", "friction", "--dir"]).arg(dir).args(extra);
+    c
+}
+
+fn run_out(mut c: Command) -> (i32, String, String) {
+    let out = c.output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into(), String::from_utf8_lossy(&out.stderr).into())
+}
+
+fn eval_friction(w: &World, url: &str, sysctl: &str, dir: &Path) -> (i32, String, String) {
+    run_out(eval_friction_cmd(w, url, sysctl, dir, &[]))
+}
+
+fn friction_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/friction-eval")
+}
+
+/// A copy of the invented eval set in the world's folder, with the pressure scripts: three sessions, a correction and
+/// another prompt in each (the fake d3 scores `wrong` and `told you` high).
+fn friction_eval_copy(w: &World) -> PathBuf {
+    let dir = w.base.join("friction-eval");
+    fs::create_dir_all(&dir).unwrap();
+    for f in ["friction.jsonl", "friction-labels-confirmed.json"] {
+        fs::copy(friction_fixture().join(f), dir.join(f)).unwrap();
+    }
+    pressure_scripts(w);
+    dir
+}
+
+/// Rows `(id, session number, prompt)` written as an eval file's lines.
+fn write_eval_rows(path: &Path, rows: &[(&str, u8, &str)]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines: Vec<String> = rows.iter().map(|(id, s, prompt)| serde_json::json!({
+        "id": id, "session_id": format!("eeeeeeee-0000-0000-0000-00000000000{s}"), "prompt": prompt,
+    }).to_string()).collect();
+    fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+/// Labels `(id, label)` written as a confirmed-labels file.
+fn write_eval_labels(path: &Path, labels: &[(&str, &str)]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let m: serde_json::Map<String, serde_json::Value> = labels.iter().map(|(id, l)| (id.to_string(), serde_json::json!({"label": l}))).collect();
+    fs::write(path, serde_json::Value::Object(m).to_string()).unwrap();
+}
+
+#[test]
+fn eval_friction_scores_the_fixture_set() {
+    let w = setup();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let db = w.base.join("fresh/folder/gopola.db");
+    let mut cmd = eval_friction_cmd(&w, &fake.url, "sysctl-1", &friction_fixture(), &[]);
+    cmd.env("GOPOLA_DB", &db);
+    let (code, out, err) = run_out(cmd);
+    assert_eq!(code, 0, "{err}");
+    // The first row's own `label` says not_friction; the confirmed file says correction, and the file wins.
+    assert_eq!(out.lines().next().unwrap(), "friction eval: 6 prompts (6 committed), 3 corrections; borderline counted negative", "{out}");
+    assert!(out.contains("d3          1.000  1.0/3 (k=1)         3 (1.00 / 1.00)\n"), "{out}");
+    assert!(out.lines().any(|l| l.starts_with("classifier  1.000")), "{out}");
+    assert!(out.lines().any(|l| l.starts_with("FR-3        1.000") && l.ends_with(" -")), "FR-3 has no flags: a rank is not a probability: {out}");
+    assert!(out.contains("committed   d3 1.000 · classifier 1.000 · FR-3 1.000\n"), "{out}");
+    assert!(out.ends_with("done line (FR-3 AP 1.0000 >= 0.6 on all prompts): pass\n"), "{out}");
+    assert_eq!((calls(&fake), unloads(&fake)), (6, 0));
+    assert_eq!(*fake.batches.lock().unwrap(), vec![6]);
+    // No database is opened; the lock file's folder is made for it.
+    assert!(!db.exists() && !w.db.exists());
+    assert!(db.with_file_name("gopola.db.friction.lock").exists());
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_json_has_the_same_fields() {
+    let w = setup();
+    pressure_scripts(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = run_out(eval_friction_cmd(&w, &fake.url, "sysctl-1", &friction_fixture(), &["--json"]));
+    assert_eq!(code, 0, "{err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["prompts"] == 6 && v["committed"] == 6 && v["corrections"] == 3, "{out}");
+    assert!((v["methods"]["fr3"]["ap"].as_f64().unwrap() - 1.0).abs() < 1e-9, "{out}");
+    assert!(v["methods"]["d3"]["flags"] == 3 && v["methods"]["d3"]["top20_k"] == 1, "{out}");
+    assert!(v["methods"]["fr3"]["flags"].is_null() && v["done_line"]["pass"] == true, "{out}");
+    assert!((v["committed_ap"]["classifier"].as_f64().unwrap() - 1.0).abs() < 1e-9, "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_adds_local_rows_when_present() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    write_eval_rows(&dir.join("local/friction-client.jsonl"), &[("eeeeeeee:7", 4, "you guessed wrong again"), ("eeeeeeee:8", 4, "looks good")]);
+    // The local labels file is used in place of the committed one: it also calls row 2 a correction.
+    write_eval_labels(&dir.join("local/friction-labels-confirmed.json"), &[
+        ("eeeeeeee:1", "correction"), ("eeeeeeee:2", "correction"), ("eeeeeeee:3", "correction"), ("eeeeeeee:4", "not_friction"),
+        ("eeeeeeee:5", "correction"), ("eeeeeeee:6", "not_friction"), ("eeeeeeee:7", "correction"), ("eeeeeeee:8", "not_friction")]);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.lines().next().unwrap(), "friction eval: 8 prompts (6 committed), 5 corrections; borderline counted negative", "{out}");
+    assert_eq!(calls(&fake), 8);
+    assert!(out.lines().any(|l| l.starts_with("committed   d3 ")), "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_names_a_bad_line_and_a_missing_label() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let rows = fs::read_to_string(friction_fixture().join("friction.jsonl")).unwrap();
+    let with_line_3 = |line: &str| {
+        let mut lines: Vec<&str> = rows.lines().collect();
+        lines[2] = line;
+        fs::write(dir.join("friction.jsonl"), lines.join("\n") + "\n").unwrap();
+    };
+    for (line, named) in [("{", "friction.jsonl:3"), (r#"{"id": "x", "session_id": "s", "prompt": 7}"#, "`prompt` is not a string"),
+                          (r#"["not", "an", "object"]"#, "friction.jsonl:3")] {
+        with_line_3(line);
+        let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+        assert_eq!((code, out.as_str()), (1, ""), "{err}");
+        assert!(err.contains("friction.jsonl:3") && err.contains(named), "{line}: {err}");
+    }
+    fs::create_dir_all(dir.join("local")).unwrap();
+    fs::write(dir.join("local/friction-client.jsonl"), "{\"id\": \"a\"}\n").unwrap();
+    fs::write(dir.join("friction.jsonl"), &rows).unwrap();
+    let err = eval_friction(&w, &fake.url, "sysctl-1", &dir).2;
+    assert!(err.contains("local/friction-client.jsonl:1"), "{err}");
+    fs::remove_file(dir.join("local/friction-client.jsonl")).unwrap();
+    // A row with no confirmed label, and a label that is not one of the three.
+    let all = [("eeeeeeee:1", "correction"), ("eeeeeeee:2", "not_friction"), ("eeeeeeee:3", "correction"), ("eeeeeeee:5", "correction"), ("eeeeeeee:6", "not_friction")];
+    write_eval_labels(&dir.join("friction-labels-confirmed.json"), &all);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("eeeeeeee:4"), "{err}");
+    write_eval_labels(&dir.join("friction-labels-confirmed.json"), &[("eeeeeeee:1", "correction"), ("eeeeeeee:2", "maybe")]);
+    let err = eval_friction(&w, &fake.url, "sysctl-1", &dir).2;
+    assert!(err.contains("eeeeeeee:2") && err.contains("'maybe' is not a label"), "{err}");
+    // An entry that is not an object with a label names its id.
+    fs::write(dir.join("friction-labels-confirmed.json"), r#"{"eeeeeeee:1": {"label": "correction"}, "eeeeeeee:2": "correction"}"#).unwrap();
+    let err = eval_friction(&w, &fake.url, "sysctl-1", &dir).2;
+    assert!(err.contains("eeeeeeee:2: not an object with a `label`"), "{err}");
+    assert_eq!(calls(&fake), 0, "nothing is asked of d3 before the files are read");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn eval_friction_without_a_pressure_source_exits_one() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let mut cmd = eval_friction_cmd(&w, &fake.url, "sysctl-1", &dir, &[]);
+    cmd.env_remove("GOPOLA_SYSCTL");
+    let (code, out, err) = run_out(cmd);
+    assert_eq!((code, out.as_str(), calls(&fake)), (1, "", 0), "{err}");
+    assert!(err.contains("friction scoring runs on macOS only"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_reads_no_more_than_eight_mebibytes_of_a_file() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let huge = vec![b' '; (8 << 20) + 1];
+    for file in ["friction.jsonl", "friction-labels-confirmed.json"] {
+        let original = fs::read(friction_fixture().join(file)).unwrap();
+        fs::write(dir.join(file), &huge).unwrap();
+        let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+        assert_eq!((code, out.as_str()), (1, ""), "{file}: {err}");
+        assert!(err.contains(file) && err.contains("is over 8388608 bytes"), "{file}: {err}");
+        fs::write(dir.join(file), original).unwrap();
+    }
+    assert_eq!(calls(&fake), 0);
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_defers_at_critical_pressure() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-4", &dir);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("memory pressure is critical"), "{err}");
+    assert_eq!((calls(&fake), unloads(&fake)), (0, 0), "no call was made, so there is nothing to unload");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_checks_pressure_before_each_call_and_unloads_d3_at_four() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1-then-4", &dir);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("memory pressure is critical (level 4)"), "{err}");
+    assert_eq!((calls(&fake), unloads(&fake)), (2, 1));
+    assert_eq!(fs::read_to_string(w.base.join("sysctl-1-then-4.count")).unwrap().trim(), "3");
+    // A pressure source that prints no number stops the run before any call.
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, _, err) = eval_friction(&w, &fake.url, "sysctl-garbage", &dir);
+    assert_eq!((code, calls(&fake)), (1, 0), "{err}");
+    assert!(err.contains("memory pressure unreadable"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_refuses_while_another_run_holds_the_lock() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let lock = fs::OpenOptions::new().create(true).write(true).truncate(false).open(format!("{}.friction.lock", w.db.display())).unwrap();
+    lock.try_lock().unwrap();
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!((code, out.as_str(), calls(&fake)), (1, "", 0), "{err}");
+    assert!(err.contains("another friction run is in progress"), "{err}");
+    drop(lock);
+    assert_eq!(eval_friction(&w, &fake.url, "sysctl-1", &dir).0, 0, "free again once its holder is gone");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_names_a_prompt_that_d3_refuses() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start_rude(8, MODEL, Rude::RejectState("flag"));
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("eeeeeeee:6") && err.contains("d3 refused the prompt"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_needs_a_correction_and_both_classes_in_every_fold() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    let fake = FakeOllama::start(8, MODEL);
+    let labels = |corrections: &[&str]| {
+        let all = ["eeeeeeee:1", "eeeeeeee:2", "eeeeeeee:3", "eeeeeeee:4", "eeeeeeee:5", "eeeeeeee:6"];
+        let l: Vec<(&str, &str)> = all.iter().map(|id| (*id, if corrections.contains(id) { "correction" } else { "borderline" })).collect();
+        write_eval_labels(&dir.join("friction-labels-confirmed.json"), &l);
+    };
+    // No correction at all: there is nothing to measure, and d3 is not asked.
+    labels(&[]);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!((code, out.as_str(), calls(&fake)), (1, "", 0), "{err}");
+    assert!(err.contains("no row is labelled a correction"), "{err}");
+    // Every correction in one session: the fold that leaves it out has none to learn from, and names it.
+    labels(&["eeeeeeee:1"]);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("eeeeeeee-0000-0000-0000-000000000001"), "{err}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_exits_zero_when_the_done_line_fails() {
+    let w = setup();
+    let dir = friction_eval_copy(&w);
+    // The labels turn the fake d3 upside down: it scores the three prompts that are not corrections high.
+    write_eval_labels(&dir.join("friction-labels-confirmed.json"), &[
+        ("eeeeeeee:1", "not_friction"), ("eeeeeeee:2", "correction"), ("eeeeeeee:3", "not_friction"),
+        ("eeeeeeee:4", "correction"), ("eeeeeeee:5", "not_friction"), ("eeeeeeee:6", "correction")]);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.ends_with("done line (FR-3 AP 0.5000 >= 0.6 on all prompts): fail\n"), "{out}");
+    fs::remove_dir_all(&w.base).unwrap();
+}
+
+#[test]
+fn eval_friction_says_when_the_committed_rows_have_no_correction() {
+    let w = setup();
+    pressure_scripts(&w);
+    let dir = w.base.join("friction-eval");
+    let committed = [("eeeeeeee:1", 1, "add a dark mode toggle"), ("eeeeeeee:2", 1, "thanks, ship it"), ("eeeeeeee:3", 2, "what does this flag do?"), ("eeeeeeee:4", 2, "looks good")];
+    write_eval_rows(&dir.join("friction.jsonl"), &committed);
+    write_eval_rows(&dir.join("local/friction-client.jsonl"), &[("eeeeeeee:5", 3, "you guessed wrong"), ("eeeeeeee:6", 3, "ok"), ("eeeeeeee:7", 4, "I told you so"), ("eeeeeeee:8", 4, "next")]);
+    write_eval_labels(&dir.join("local/friction-labels-confirmed.json"), &[
+        ("eeeeeeee:1", "not_friction"), ("eeeeeeee:2", "not_friction"), ("eeeeeeee:3", "not_friction"), ("eeeeeeee:4", "not_friction"),
+        ("eeeeeeee:5", "correction"), ("eeeeeeee:6", "not_friction"), ("eeeeeeee:7", "correction"), ("eeeeeeee:8", "not_friction")]);
+    let fake = FakeOllama::start(8, MODEL);
+    let (code, out, err) = eval_friction(&w, &fake.url, "sysctl-1", &dir);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("8 prompts (4 committed), 2 corrections"), "{out}");
+    assert!(out.contains("\ncommitted   no correction among the committed prompts\n"), "no AP of 0.000 stands for a set with no correction: {out}");
+    let (_, json, _) = run_out(eval_friction_cmd(&w, &fake.url, "sysctl-1", &dir, &["--json"]));
+    assert!(serde_json::from_str::<serde_json::Value>(&json).unwrap()["committed_ap"].is_null(), "{json}");
     fs::remove_dir_all(&w.base).unwrap();
 }

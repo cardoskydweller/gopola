@@ -3,7 +3,7 @@
 use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: &str = "9";
+pub const SCHEMA_VERSION: &str = "10";
 
 pub fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("GOPOLA_DB") {
@@ -68,6 +68,14 @@ fn migrate(c: &Connection) -> rusqlite::Result<()> {
          create table if not exists fts_ref (
            kind text not null, ref text not null, rid integer not null primary key);
          create index if not exists fts_ref_kind_ref on fts_ref(kind, ref);
+         create table if not exists scores (
+           session_id text not null, n integer not null, model text not null, hash text not null,
+           score real, error text, ts text not null,
+           primary key (session_id, n, model));
+         create table if not exists labels (
+           session_id text not null, n integer not null, label text not null, source text not null,
+           ts text not null, confirmed integer not null default 0,
+           primary key (session_id, n));
          create index if not exists sessions_project_started on sessions(project, started_at);",
     )?;
     let cols: Vec<String> = c
